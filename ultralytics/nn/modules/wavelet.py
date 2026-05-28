@@ -70,6 +70,10 @@ class WaveDown(nn.Module):
             nn.BatchNorm2d(c2),
             nn.SiLU(inplace=True),
         )
+        # Warm init: at step 0 the block behaves like AvgPool-stride-2 + 1x1 conv,
+        # so downstream pretrained layers see a sensible signal instead of noise
+        # added by random high-frequency projections.
+        nn.init.zeros_(self.proj_hf.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         sub = self.dwt(x)                                  # (B, 4, C, H/2, W/2)
