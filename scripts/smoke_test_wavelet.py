@@ -33,7 +33,7 @@ def build_and_probe(cfg: str, scale: str = "n"):
 
 
 if __name__ == "__main__":
-    build_and_probe("ultralytics/cfg/models/v12/yolov12.yaml")
-    build_and_probe("ultralytics/cfg/models/v12/yolov12-wavelet-p3.yaml")
-    build_and_probe("ultralytics/cfg/models/v12/yolov12-wavelet.yaml")
+    build_and_probe("ultralytics/cfg/models/v12/yolov12s.yaml")
+    build_and_probe("ultralytics/cfg/models/v12/yolov12s-wavelet-p3.yaml")
+    build_and_probe("ultralytics/cfg/models/v12/yolov12s-wavelet.yaml")
     print("\nOK")
