@@ -35,9 +35,9 @@ class HaarDWT(nn.Module):
     def __init__(self, in_channels: int):
         super().__init__()
         self.in_channels = in_channels
-        kernels = _haar_kernels()                # (4, 2, 2)
-        weight = kernels.repeat(in_channels, 1, 1, 1)  # (4*C, 2, 2)
-        weight = weight.unsqueeze(1)             # (4*C, 1, 2, 2)
+        kernels = _haar_kernels()                       # (4, 2, 2)
+        weight = kernels.repeat(in_channels, 1, 1)      # (4*C, 2, 2)
+        weight = weight.unsqueeze(1)                    # (4*C, 1, 2, 2)
         self.register_buffer("weight", weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
