@@ -88,6 +88,7 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .wavelet import HaarDWT, WaveDown
 
 __all__ = (
     "Conv",
@@ -161,5 +162,7 @@ __all__ = (
     "PSA",
     "TorchVision",
     "Index",
-    "A2C2f"
+    "A2C2f",
+    "HaarDWT",
+    "WaveDown",
 )
