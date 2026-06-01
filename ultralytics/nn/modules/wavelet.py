@@ -117,4 +117,96 @@ class WaveDown(nn.Module):
         return self.fuse(torch.cat([self.proj_ll(ll), self.proj_hf(hf)], dim=1))
 
 
-__all__ = ("HaarDWT", "WaveDown")
+class WaveAttnDown(nn.Module):
+    """Strategy A — stride-2 downsampling Conv with wavelet-HF attention gate.
+
+    Main path mirrors the Ultralytics Conv attribute layout (``self.conv``,
+    ``self.bn``, ``self.act``) so a pretrained Conv at the same model index
+    transfers via name-matched ``load_state_dict``. A parallel branch computes
+    HF features from the pre-downsample input via Haar DWT and applies them
+    as a multiplicative residual gate.
+
+    At init: ``alpha = 0`` → forward output = main path exactly. The wavelet
+    branch contributes nothing until alpha learns a non-zero value, so this
+    block can only improve over a vanilla stride-2 Conv (never degrade).
+    """
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 2, p=None, g: int = 1, d: int = 1):
+        super().__init__()
+        pad = (k - 1) // 2 if p is None else p
+        # Names match Ultralytics Conv class so pretrained weights transfer.
+        self.conv = nn.Conv2d(c1, c2, k, s, padding=pad, groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+        self.dwt = HaarDWT(c1)
+        self.hf_proj = nn.Conv2d(3 * c1, c2, 1, bias=False)
+        self.attn_bn = nn.BatchNorm2d(c2)
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.act(self.bn(self.conv(x)))                          # main path
+        hf = self.dwt(x)[:, 1:].flatten(1, 2)                        # (B, 3C, H/2, W/2)
+        attn = torch.sigmoid(self.attn_bn(self.hf_proj(hf)))         # (B, c2, H/2, W/2)
+        return y * (1 + self.alpha * attn)
+
+
+class WaveHFSkip(nn.Module):
+    """Strategy B — HF-only side branch that produces a narrow feature map at
+    half resolution. Intended to be referenced from the head/neck and
+    concatenated alongside an existing FPN concat (e.g. inject input-side
+    HF detail into the P3 detection scale).
+
+    The main backbone path is NOT touched, so pretrained Conv weights at the
+    insertion point remain intact. The projection is zero-init so the new
+    concat'd channels contribute zero at step 0 — downstream layers see the
+    same input distribution as baseline.
+    """
+
+    def __init__(self, c1: int, c_out: int):
+        super().__init__()
+        self.dwt = HaarDWT(c1)
+        self.proj = nn.Conv2d(3 * c1, c_out, 1, bias=False)
+        self.bn = nn.BatchNorm2d(c_out)
+        self.act = nn.SiLU()
+        nn.init.zeros_(self.proj.weight)  # step-0 contribution = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hf = self.dwt(x)[:, 1:].flatten(1, 2)                        # (B, 3C, H/2, W/2)
+        return self.act(self.bn(self.proj(hf)))
+
+
+class WaveUp(nn.Module):
+    """Strategy C — wavelet-augmented 2× upsampling. Drop-in replacement for
+    ``nn.Upsample(scale_factor=2, mode='nearest')`` in the neck.
+
+    Base path  : nearest-neighbour upsample (matches pretrained behaviour).
+    Residual   : predict LH/HL/HH from input via 1×1 conv, synthesise via
+                 Haar inverse DWT (transposed conv with the HF kernels).
+    Output     : ``base + alpha * residual``.
+
+    At init: ``alpha = 0`` and ``hf_pred`` is also zero-init, so the output is
+    exactly the nearest-neighbour upsample. Pretrained downstream layers see
+    the same distribution as before.
+    """
+
+    def __init__(self, c: int):
+        super().__init__()
+        self.c = c
+        self.hf_pred = nn.Conv2d(c, 3 * c, 1, bias=False)
+        nn.init.zeros_(self.hf_pred.weight)
+        # IDWT uses the HF kernels (LH, HL, HH) only — the LL/base term is
+        # provided by the nearest-neighbour interpolation in forward().
+        kernels = _haar_kernels()[1:]                                # (3, 2, 2)
+        weight = kernels.repeat(c, 1, 1).unsqueeze(1)                # (3C, 1, 2, 2)
+        self.register_buffer("idwt_weight", weight)
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = F.interpolate(x, scale_factor=2, mode="nearest")
+        hf = self.hf_pred(x)                                         # (B, 3C, H, W)
+        residual = F.conv_transpose2d(hf, self.idwt_weight, stride=2, groups=self.c)
+        return base + self.alpha * residual
+
+
+__all__ = ("HaarDWT", "WaveDown", "WaveAttnDown", "WaveHFSkip", "WaveUp")
