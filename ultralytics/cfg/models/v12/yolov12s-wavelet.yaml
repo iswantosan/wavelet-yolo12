@@ -18,7 +18,7 @@ backbone:
   - [-1, 2, C3k2,     [512, False, 0.25]]
   - [-1, 1, WaveDown, [512]]                    # 5-P4/16 (wavelet)
   - [-1, 4, A2C2f,    [512, True, 4]]
-  - [-1, 1, WaveDown, [1024]]                   # 7-P5/32 (wavelet)
+  - [-1, 1, Conv,     [1024, 3, 2]]             # 7-P5/32
   - [-1, 4, A2C2f,    [1024, True, 1]]          # 8
 
 head:
