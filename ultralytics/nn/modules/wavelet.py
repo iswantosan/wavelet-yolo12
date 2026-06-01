@@ -70,10 +70,45 @@ class WaveDown(nn.Module):
             nn.BatchNorm2d(c2),
             nn.SiLU(inplace=True),
         )
-        # Warm init: at step 0 the block behaves like AvgPool-stride-2 + 1x1 conv,
-        # so downstream pretrained layers see a sensible signal instead of noise
-        # added by random high-frequency projections.
+        # Warm init: at step 0 the block reduces to SiLU(BN(AvgPool(X))).
+        # - proj_ll = identity (zero-padded if c1 != c2), so Y_LL = S_LL.
+        # - proj_hf = 0, so Y_HF = 0.
+        # - fuse's LL columns = identity, HF columns = small Kaiming, so the
+        #   step-0 output is exactly Y_LL while gradients still flow back to
+        #   proj_hf during training (allowing the high-frequency stream to grow).
+        self._identity_init_1x1(self.proj_ll)
         nn.init.zeros_(self.proj_hf.weight)
+        self._warm_init_fuse_conv(self.fuse[0], lf_channels=c2, hf_scale=1e-2)
+
+    @staticmethod
+    def _identity_init_1x1(conv: nn.Conv2d) -> None:
+        """Identity-like init for a 1×1 conv: top-left min(c_in, c_out) block is the
+        identity matrix, rest is zero. For c_in == c_out this is exact identity."""
+        with torch.no_grad():
+            conv.weight.zero_()
+            n = min(conv.in_channels, conv.out_channels)
+            for i in range(n):
+                conv.weight[i, i, 0, 0] = 1.0
+
+    @staticmethod
+    def _warm_init_fuse_conv(conv: nn.Conv2d, lf_channels: int, hf_scale: float) -> None:
+        """Warm-init for the fusion 1×1 conv. The input layout is
+        concat(Y_LL, Y_HF) with Y_LL occupying the first ``lf_channels`` channels.
+        The LL block is initialised to identity so Y_LL passes through unchanged
+        at step 0, while the HF block receives a small Kaiming init so that
+        ∂Y/∂Y_HF is non-zero and gradients can still flow back to proj_hf."""
+        with torch.no_grad():
+            conv.weight.zero_()
+            c_out = conv.out_channels
+            # LL columns (first lf_channels of the input) → identity to c_out.
+            n = min(lf_channels, c_out)
+            for i in range(n):
+                conv.weight[i, i, 0, 0] = 1.0
+            # HF columns (remaining input channels) → small Kaiming for grad flow.
+            hf_block = conv.weight[:, lf_channels:, :, :]
+            if hf_block.numel() > 0:
+                nn.init.kaiming_uniform_(hf_block, a=5 ** 0.5)
+                hf_block.mul_(hf_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         sub = self.dwt(x)                                  # (B, 4, C, H/2, W/2)
