@@ -151,6 +151,61 @@ class WaveAttnDown(nn.Module):
         return y * (1 + self.alpha * attn)
 
 
+class WaveAttnDownV2(nn.Module):
+    """Strategy A v2 — improved wavelet-augmented stride-2 downsampling.
+
+    Key differences from WaveAttnDown (v1):
+
+    1. **No single-scalar α bottleneck.** v1 used a learned α (init 0) to gate
+       a sigmoid attention mask. At α=0 the backward gradient to ``hf_proj``
+       is zero, so the wavelet projection cannot learn until α grows — a
+       chicken-and-egg problem that empirically caps the wavelet branch's
+       contribution.
+       v2 uses an additive residual without the α gate. Each output channel
+       learns its own wavelet contribution via per-channel projection weights.
+
+    2. **Structured HF processing.** The wavelet branch is a 3×3 → 1×1
+       Conv-BN-SiLU block instead of a single 1×1 projection. The 3×3 conv
+       captures local spatial coherence of HF features (edges run along
+       directions, not isolated pixels).
+
+    3. **Small-but-non-zero init** on the final projection (Kaiming × 0.05),
+       so step-0 residual is small (≈ 5% of natural scale) but the full
+       branch receives non-zero gradients from the first batch.
+
+    Main path mirrors Ultralytics Conv attribute names (``conv``, ``bn``,
+    ``act``) so pretrained Conv weights transfer by name.
+    """
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 2, p=None, g: int = 1, d: int = 1):
+        super().__init__()
+        pad = (k - 1) // 2 if p is None else p
+        # Main path — Ultralytics-Conv compatible names for pretrain match.
+        self.conv = nn.Conv2d(c1, c2, k, s, padding=pad, groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+        # Wavelet HF branch — structured 3×3 → 1×1 with BN/SiLU.
+        self.dwt = HaarDWT(c1)
+        c_mid = max(c2 // 2, 16)
+        self.hf_branch = nn.Sequential(
+            nn.Conv2d(3 * c1, c_mid, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c_mid),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c_mid, c2, 1, bias=False),
+        )
+        # Final 1×1 weight scaled to ~5% of Kaiming, so step-0 residual is
+        # small but gradients flow normally (no zero-init dead-gradient trap).
+        with torch.no_grad():
+            self.hf_branch[3].weight.mul_(0.05)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.act(self.bn(self.conv(x)))                          # main downsample
+        hf = self.dwt(x)[:, 1:].flatten(1, 2)                        # (B, 3C, H/2, W/2)
+        residual = self.hf_branch(hf)                                # ~5% scale at init
+        return y + residual
+
+
 class WaveHFSkip(nn.Module):
     """Strategy B — HF-only side branch that produces a narrow feature map at
     half resolution. Intended to be referenced from the head/neck and
@@ -209,4 +264,4 @@ class WaveUp(nn.Module):
         return base + self.alpha * residual
 
 
-__all__ = ("HaarDWT", "WaveDown", "WaveAttnDown", "WaveHFSkip", "WaveUp")
+__all__ = ("HaarDWT", "WaveDown", "WaveAttnDown", "WaveAttnDownV2", "WaveHFSkip", "WaveUp")

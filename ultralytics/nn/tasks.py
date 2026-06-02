@@ -66,6 +66,7 @@ from ultralytics.nn.modules import (
     v10Detect,
     A2C2f,
     WaveAttnDown,
+    WaveAttnDownV2,
     WaveDown,
     WaveHFSkip,
     WaveUp,
@@ -1003,6 +1004,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             A2C2f,
             WaveDown,
             WaveAttnDown,
+            WaveAttnDownV2,
             WaveHFSkip,
         }:
             c1, c2 = ch[f], args[0]

@@ -1,0 +1,51 @@
+# Wavelet-YOLOv12s — Strategy A v2: WaveAttnDownV2 at P3.
+# Improved version of yolov12s-wavelet-attn.yaml. Same backbone position,
+# same number of detection heads. The only change is the wavelet block:
+#   v1 (WaveAttnDown)  : main + sigmoid(BN(HF)) gated by scalar α (init 0)
+#                        → backward gradient to hf_proj is zero at init,
+#                          wavelet branch trains slowly (the "tie" result)
+#   v2 (WaveAttnDownV2): main + 3×3→1×1 conv-BN-SiLU block on HF, additive
+#                        residual, small (×0.05) but non-zero final init.
+#                        Gradient flows through full wavelet branch from
+#                        step 0; each output channel learns its own
+#                        wavelet contribution.
+# Filename suffix 's' is parsed by Ultralytics regex 'yolov?\d+([nslmx])'
+# so scale='s' is auto-detected.
+
+nc: 80
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  - [-1, 1, Conv,           [64, 3, 2]]               # 0-P1/2
+  - [-1, 1, Conv,           [128, 3, 2, 1, 2]]        # 1-P2/4
+  - [-1, 2, C3k2,           [256, False, 0.25]]       # 2
+  - [-1, 1, WaveAttnDownV2, [256, 3, 2]]              # 3-P3/8  (wavelet attn v2)
+  - [-1, 2, C3k2,           [512, False, 0.25]]       # 4
+  - [-1, 1, Conv,           [512, 3, 2]]              # 5-P4/16
+  - [-1, 4, A2C2f,          [512, True, 4]]           # 6
+  - [-1, 1, Conv,           [1024, 3, 2]]             # 7-P5/32
+  - [-1, 4, A2C2f,          [1024, True, 1]]          # 8
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]        # 9
+  - [[-1, 6], 1, Concat, [1]]                         # 10
+  - [-1, 2, A2C2f, [512, False, -1]]                  # 11
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]        # 12
+  - [[-1, 4], 1, Concat, [1]]                         # 13
+  - [-1, 2, A2C2f, [256, False, -1]]                  # 14  P3 detect
+
+  - [-1, 1, Conv, [256, 3, 2]]                        # 15
+  - [[-1, 11], 1, Concat, [1]]                        # 16
+  - [-1, 2, A2C2f, [512, False, -1]]                  # 17  P4 detect
+
+  - [-1, 1, Conv, [512, 3, 2]]                        # 18
+  - [[-1, 8], 1, Concat, [1]]                         # 19
+  - [-1, 2, C3k2, [1024, True]]                       # 20  P5 detect
+
+  - [[14, 17, 20], 1, Detect, [nc]]                   # P3, P4, P5

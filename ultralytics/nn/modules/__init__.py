@@ -88,7 +88,7 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
-from .wavelet import HaarDWT, WaveAttnDown, WaveDown, WaveHFSkip, WaveUp
+from .wavelet import HaarDWT, WaveAttnDown, WaveAttnDownV2, WaveDown, WaveHFSkip, WaveUp
 
 __all__ = (
     "Conv",
@@ -166,6 +166,7 @@ __all__ = (
     "HaarDWT",
     "WaveDown",
     "WaveAttnDown",
+    "WaveAttnDownV2",
     "WaveHFSkip",
     "WaveUp",
 )
