@@ -134,6 +134,46 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7
     return iou  # IoU
 
 
+def wasserstein_similarity(box1, box2, xywh=True, C=12.8, eps=1e-7):
+    """Normalised Gaussian Wasserstein similarity (NWD) for tiny object detection.
+
+    Each box is modelled as a 2D Gaussian N(μ, Σ) with μ = (cx, cy) and Σ a
+    diagonal covariance with (w/2)² and (h/2)² on the diagonal. The squared
+    Wasserstein-2 distance between two such Gaussians has the closed form
+
+        W²(N1, N2) = (cx1 − cx2)² + (cy1 − cy2)² + ((w1 − w2)/2)² + ((h1 − h2)/2)²
+
+    The similarity is then NWD = exp(−sqrt(W²) / C), bounded in (0, 1], where
+    C is a dataset-specific normalisation constant (~ mean object scale).
+
+    Reference: Wang et al., "A Normalized Gaussian Wasserstein Distance for
+    Tiny Object Detection", ICME 2021 / IJCV 2022.
+
+    Args:
+        box1, box2: tensors with last dim = 4, broadcastable shapes.
+        xywh: if True, interpret boxes as (cx, cy, w, h); else (x1, y1, x2, y2).
+        C: normalisation constant. Defaults to 12.8 (paper default).
+        eps: numerical stability.
+
+    Returns:
+        Tensor of NWD similarities, same broadcast shape as box1/box2 minus
+        the trailing dim of 4.
+    """
+    if xywh:
+        cx1, cy1, w1, h1 = box1.chunk(4, -1)
+        cx2, cy2, w2, h2 = box2.chunk(4, -1)
+    else:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+        cx1, cy1 = (b1_x1 + b1_x2) * 0.5, (b1_y1 + b1_y2) * 0.5
+        w1, h1 = (b1_x2 - b1_x1), (b1_y2 - b1_y1)
+        cx2, cy2 = (b2_x1 + b2_x2) * 0.5, (b2_y1 + b2_y2) * 0.5
+        w2, h2 = (b2_x2 - b2_x1), (b2_y2 - b2_y1)
+
+    w_sq = (cx1 - cx2).pow(2) + (cy1 - cy2).pow(2) + ((w1 - w2) * 0.5).pow(2) + ((h1 - h2) * 0.5).pow(2)
+    return torch.exp(-(w_sq + eps).sqrt() / C)
+
+
 def mask_iou(mask1, mask2, eps=1e-7):
     """
     Calculate masks IoU.

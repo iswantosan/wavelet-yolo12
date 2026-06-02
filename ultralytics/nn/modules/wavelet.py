@@ -206,6 +206,70 @@ class WaveAttnDownV2(nn.Module):
         return y + residual
 
 
+class WaveAttnDownV3(nn.Module):
+    """Strategy A v3 — minimal-capacity wavelet spatial gate (~10 params).
+
+    A bet that v1 (alpha-gated) and v2 (additive residual) both underperform
+    because the wavelet branch adds *too much* capacity and either interferes
+    with the pretrained main path or overfits the small training set.
+
+    v3 strips the wavelet branch down to a single learnable spatial gate
+    derived from the HF energy map. The wavelet is no longer a parallel
+    feature path; it becomes a *structural prior* that modulates the main
+    conv output spatially.
+
+    Forward:
+      energy(x, y) = mean over (band, channel) of |HF_subband|²
+      energy_norm  = per-image z-score of energy
+      gate(x, y)   = 2 · σ(Conv3x3(energy_norm))     # init = 1.0
+      output       = main_conv(x) · gate
+
+    Init: Conv3x3 weight = bias = 0 → gate = 1.0 → output = main path
+    exactly. Gradient to the gate flows non-trivially from step 0 (sigmoid
+    derivative at 0 = 0.25, energy_norm is non-zero), so training can begin
+    learning the gate immediately.
+
+    Parameters added: 9 (Conv weight) + 1 (Conv bias) = 10 total.
+
+    Hypothesis: bacilli correlate with locally elevated HF energy in the
+    input. A learned spatial gate exploiting this prior provides task-
+    aligned regularisation; extra wavelet feature processing (v1, v2) hurts
+    by either interfering with the pretrained main path (v2) or being
+    bottlenecked by zero-init scalars (v1).
+
+    Main path mirrors Ultralytics Conv attribute layout for pretrained
+    weight transfer.
+    """
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 2, p=None, g: int = 1, d: int = 1):
+        super().__init__()
+        pad = (k - 1) // 2 if p is None else p
+        self.conv = nn.Conv2d(c1, c2, k, s, padding=pad, groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+        self.dwt = HaarDWT(c1)
+        # 3×3 spatial smoother over the 1-channel HF energy map (10 params).
+        self.gate = nn.Conv2d(1, 1, 3, padding=1, bias=True)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.act(self.bn(self.conv(x)))                          # main downsample
+
+        # Per-pixel HF energy (averaged over bands + channels) → (B, 1, H/2, W/2).
+        hf = self.dwt(x)[:, 1:]                                      # (B, 3, C, H/2, W/2)
+        energy = hf.pow(2).mean(dim=(1, 2), keepdim=False).unsqueeze(1)
+
+        # Per-image z-score so the gate sees a scale-invariant signal.
+        mu = energy.mean(dim=(2, 3), keepdim=True)
+        sigma = energy.std(dim=(2, 3), keepdim=True) + 1e-6
+        energy = (energy - mu) / sigma
+
+        gate = 2 * torch.sigmoid(self.gate(energy))                  # init: 1.0
+        return y * gate
+
+
 class WaveHFSkip(nn.Module):
     """Strategy B — HF-only side branch that produces a narrow feature map at
     half resolution. Intended to be referenced from the head/neck and
@@ -264,4 +328,4 @@ class WaveUp(nn.Module):
         return base + self.alpha * residual
 
 
-__all__ = ("HaarDWT", "WaveDown", "WaveAttnDown", "WaveAttnDownV2", "WaveHFSkip", "WaveUp")
+__all__ = ("HaarDWT", "WaveDown", "WaveAttnDown", "WaveAttnDownV2", "WaveAttnDownV3", "WaveHFSkip", "WaveUp")

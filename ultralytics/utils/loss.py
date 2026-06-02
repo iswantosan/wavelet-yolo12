@@ -9,7 +9,7 @@ from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
-from .metrics import bbox_iou, probiou
+from .metrics import bbox_iou, probiou, wasserstein_similarity
 from .tal import bbox2dist
 
 
@@ -89,18 +89,38 @@ class DFLoss(nn.Module):
 
 
 class BboxLoss(nn.Module):
-    """Criterion class for computing training losses during training."""
+    """Criterion class for computing training losses during training.
 
-    def __init__(self, reg_max=16):
+    Supports an optional Normalised Gaussian Wasserstein Distance (NWD)
+    regression loss blended with the default CIoU loss. With ``nwd_ratio=0``
+    behaviour is identical to the upstream Ultralytics implementation. With
+    ``nwd_ratio>0`` the bbox regression loss becomes
+
+        loss = (1 − nwd_ratio) · (1 − CIoU) + nwd_ratio · (1 − NWD)
+
+    NWD is particularly effective for very small objects (sub-20-pixel) where
+    pixel-discretised IoU is unstable.
+    """
+
+    def __init__(self, reg_max=16, nwd_ratio=0.0, nwd_c=12.8):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.nwd_ratio = float(nwd_ratio)
+        self.nwd_c = float(nwd_c)
 
     def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
-        """IoU loss."""
+        """IoU loss (with optional NWD blend)."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+        if self.nwd_ratio > 0.0:
+            nwd = wasserstein_similarity(
+                pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, C=self.nwd_c
+            )
+            loss_nwd = ((1.0 - nwd) * weight).sum() / target_scores_sum
+            loss_iou = (1.0 - self.nwd_ratio) * loss_iou + self.nwd_ratio * loss_nwd
 
         # DFL loss
         if self.dfl_loss:
@@ -174,7 +194,12 @@ class v8DetectionLoss:
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        # Optional NWD bbox loss blend (no-op when nwd_ratio == 0). Read via
+        # h.get() so users can enable via overrides without modifying the
+        # default cfg schema.
+        nwd_ratio = float(h.get("nwd_ratio", 0.0) or 0.0)
+        nwd_c = float(h.get("nwd_c", 12.8) or 12.8)
+        self.bbox_loss = BboxLoss(m.reg_max, nwd_ratio=nwd_ratio, nwd_c=nwd_c).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets, batch_size, scale_tensor):
