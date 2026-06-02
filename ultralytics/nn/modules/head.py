@@ -15,7 +15,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect"
 
 
 class Detect(nn.Module):
@@ -170,6 +170,165 @@ class Detect(nn.Module):
         scores, index = scores.flatten(1).topk(min(max_det, anchors))
         i = torch.arange(batch_size)[..., None]  # batch indices
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
+
+
+class DyHeadBlock(nn.Module):
+    """Single Dynamic Head attention block (Dai et al., CVPR 2021).
+
+    Stacks three attentions over the (Level × Channel × Spatial) feature
+    tensor produced by the FPN/PAN:
+
+      π_L : scale-aware attention across pyramid levels
+      π_S : spatial-aware attention (simplified — depthwise 3×3 + GroupNorm
+            in place of the original DCNv2 to avoid the deformable-conv
+            dependency; this is the common YOLO-port simplification)
+      π_C : task-aware attention (per-channel affine (α, β) predicted via
+            squeeze-excitation-style MLP)
+
+    Operates on a list of L feature tensors that all share the same channel
+    dimension. Levels are mixed by resizing to each target's spatial shape
+    and applying the scale-attention weights.
+    """
+
+    def __init__(self, c: int, reduction: int = 4):
+        super().__init__()
+        self.c = c
+
+        # π_L : per-level scalar weights from GAP-pooled features.
+        self.scale_pool = nn.AdaptiveAvgPool2d(1)
+        self.scale_conv = nn.Conv2d(c, 1, 1)
+
+        # π_S : spatial-aware modulation (DCNv2-free approximation).
+        self.spatial_conv = nn.Conv2d(c, c, 3, padding=1, groups=c, bias=False)
+        # GroupNorm with at most 16 groups (or fewer if c < 16).
+        groups = min(16, c)
+        while c % groups != 0 and groups > 1:
+            groups -= 1
+        self.spatial_norm = nn.GroupNorm(groups, c)
+
+        # π_C : task-aware per-channel (α, β) prediction.
+        c_hid = max(c // reduction, 8)
+        self.task_fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, c_hid, 1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c_hid, 2 * c, 1),
+        )
+        # Init the final layer so step-0 output is (α, β) = (1, 0) → identity.
+        nn.init.zeros_(self.task_fc[-1].weight)
+        with torch.no_grad():
+            self.task_fc[-1].bias.zero_()
+            self.task_fc[-1].bias[:c].fill_(1.0)
+
+    def forward(self, features):
+        """features: list of L tensors (B, C, H_l, W_l) — same C, varying H/W.
+
+        Returns: list of L modulated tensors with the same shapes.
+        """
+        L = len(features)
+        # Scale-aware weights per level (broadcast across spatial).
+        scale_w = [torch.sigmoid(self.scale_conv(self.scale_pool(f))) for f in features]
+
+        outputs = []
+        for i, fi in enumerate(features):
+            # Aggregate features across levels by resizing + weighted sum.
+            acc = fi.clone() * scale_w[i]
+            denom = scale_w[i].clone()
+            for j, fj in enumerate(features):
+                if j == i:
+                    continue
+                fj_resized = torch.nn.functional.interpolate(
+                    fj, size=fi.shape[-2:], mode="bilinear", align_corners=False
+                )
+                acc = acc + scale_w[j] * fj_resized
+                denom = denom + scale_w[j]
+            mixed = acc / (denom + 1e-6)
+
+            # Spatial modulation (depthwise 3x3 + GroupNorm).
+            spatial = self.spatial_norm(self.spatial_conv(mixed))
+
+            # Task-aware per-channel affine.
+            ab = self.task_fc(spatial)
+            alpha = ab[:, : self.c]
+            beta = ab[:, self.c :]
+            outputs.append(alpha * spatial + beta)
+        return outputs
+
+
+class DyHeadDetect(Detect):
+    """YOLO Detect head augmented with stacked DyHead attention blocks.
+
+    Drop-in replacement for ``Detect``. Takes the multi-scale neck outputs,
+    projects each to a common channel dimension, applies ``num_blocks``
+    DyHead attention blocks across (Level, Spatial, Channel), then runs the
+    standard regression/classification branches.
+
+    Use in YAML exactly like Detect, with an optional ``num_blocks`` arg::
+
+        - [[14, 17, 20], 1, DyHeadDetect, [nc, 2]]   # nc, num_blocks=2 (default)
+
+    The DyHead channel dim is the smallest of the input channel widths so
+    that scale features can be mixed without information loss from up-
+    projection. Init of the task-attention sets (α, β) = (1, 0) so step-0
+    behaviour is close to a vanilla 3-conv detection head (the only
+    architectural difference at init is the channel projection + 3×3
+    depthwise conv with GroupNorm in the spatial branch).
+    """
+
+    def __init__(self, nc: int = 80, num_blocks: int = 2, ch: tuple = ()):
+        # Initialise the parent Detect first so attributes like nl, reg_max,
+        # no, stride, dfl, end2end one2one branches are all present.
+        super().__init__(nc, ch)
+
+        # Common channel dim for DyHead = smallest input channel width.
+        c_dyhead = min(ch)
+        self.c_dyhead = c_dyhead
+
+        # Project each scale to c_dyhead (1×1 conv, no bn/act — light).
+        self.dyhead_proj = nn.ModuleList(
+            nn.Conv2d(c, c_dyhead, 1, bias=False) if c != c_dyhead else nn.Identity()
+            for c in ch
+        )
+
+        # Stacked DyHead blocks.
+        self.dyhead_blocks = nn.ModuleList(DyHeadBlock(c_dyhead) for _ in range(num_blocks))
+
+        # Rebuild cv2 / cv3 to consume c_dyhead channels (parent built them
+        # against original `ch`).
+        c2 = max((16, c_dyhead // 4, self.reg_max * 4))
+        c3 = max(c_dyhead, min(self.nc, 100))
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(c_dyhead, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1))
+            for _ in range(self.nl)
+        )
+        self.cv3 = (
+            nn.ModuleList(
+                nn.Sequential(Conv(c_dyhead, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1))
+                for _ in range(self.nl)
+            )
+            if self.legacy
+            else nn.ModuleList(
+                nn.Sequential(
+                    nn.Sequential(DWConv(c_dyhead, c_dyhead, 3), Conv(c_dyhead, c3, 1)),
+                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                    nn.Conv2d(c3, self.nc, 1),
+                )
+                for _ in range(self.nl)
+            )
+        )
+        # If end2end (v10Detect-style), rebuild the one2one branches too.
+        if self.end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+    def forward(self, x):
+        # 1) Project to common channel dim.
+        x = [proj(xi) for proj, xi in zip(self.dyhead_proj, x)]
+        # 2) Stacked DyHead attention.
+        for block in self.dyhead_blocks:
+            x = block(x)
+        # 3) Standard Detect head logic (cv2/cv3 + inference path).
+        return super().forward(x)
 
 
 class Segment(Detect):
