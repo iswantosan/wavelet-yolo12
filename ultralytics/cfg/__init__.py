@@ -154,6 +154,7 @@ CFG_FLOAT_KEYS = {  # integer or float arguments, i.e. x=2 and x=2.0
     "time",
     "workspace",
     "batch",
+    "nwd_c",
 }
 CFG_FRACTION_KEYS = {  # fractional float arguments with 0.0<=values<=1.0
     "dropout",
@@ -178,6 +179,7 @@ CFG_FRACTION_KEYS = {  # fractional float arguments with 0.0<=values<=1.0
     "conf",
     "iou",
     "fraction",
+    "nwd_ratio",
 }
 CFG_INT_KEYS = {  # integer-only arguments
     "epochs",
