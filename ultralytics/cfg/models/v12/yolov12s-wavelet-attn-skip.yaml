@@ -1,0 +1,74 @@
+# Wavelet-YOLOv12s — multi-position wavelet stack.
+#
+# Two complementary wavelet integrations in a single architecture:
+#
+#   1. **WaveAttnDown at backbone P3** (layer 3)
+#      Replaces the P2->P3 stride-2 Conv with a wavelet-augmented gated
+#      version. Main conv path keeps pretrained yolov12s.pt weights;
+#      a parallel HF attention branch (α-gated, init=0) preserves the
+#      high-frequency signal that vanilla stride-2 conv attenuates.
+#
+#   2. **WaveHFSkip from backbone P2 to neck P3** (layer 9)
+#      A side branch reads the early backbone P2 feature (layer 2) and
+#      produces a low-channel HF feature map at P3 resolution. This is
+#      concatenated alongside the existing P3 concat in the neck, so the
+#      detection head sees raw input-side high-frequency detail that the
+#      backbone may have lost via subsequent downsampling.
+#
+# Together: backbone preserves HF *during* downsampling (WaveAttn), and
+# the head also receives a *bypass* HF skip-connection (WaveHFSkip). The
+# two are complementary — different placements, different mechanisms.
+#
+# Pretrained transfer:
+#   - Backbone 0,1,2,4-8: full match.
+#   - Backbone 3 (WaveAttnDown): main path (conv/bn/act) matches; HF branch
+#     (hf_proj, attn_bn, alpha) is fresh.
+#   - Head: WaveHFSkip prepended shifts subsequent indices by +1 compared
+#     to baseline, so the pretrained head does NOT match by index. Head
+#     learns from scratch but backbone is solid.
+#
+# Filename suffix 's' is parsed by Ultralytics regex 'yolov?\d+([nslmx])'
+# so scale='s' is auto-detected.
+
+nc: 80
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  - [-1, 1, Conv,         [64, 3, 2]]               # 0-P1/2
+  - [-1, 1, Conv,         [128, 3, 2, 1, 2]]        # 1-P2/4
+  - [-1, 2, C3k2,         [256, False, 0.25]]       # 2  (P2 — HF skip source)
+  - [-1, 1, WaveAttnDown, [256, 3, 2]]              # 3-P3/8  (wavelet attention)
+  - [-1, 2, C3k2,         [512, False, 0.25]]       # 4
+  - [-1, 1, Conv,         [512, 3, 2]]              # 5-P4/16
+  - [-1, 4, A2C2f,        [512, True, 4]]           # 6
+  - [-1, 1, Conv,         [1024, 3, 2]]             # 7-P5/32
+  - [-1, 4, A2C2f,        [1024, True, 1]]          # 8
+
+head:
+  # HF skip branch from backbone P2 -> P3 resolution (64 ch pre-scale).
+  - [2, 1, WaveHFSkip, [64]]                        # 9
+
+  # FPN top-down
+  - [8, 1, nn.Upsample, [None, 2, "nearest"]]       # 10
+  - [[-1, 6], 1, Concat, [1]]                       # 11
+  - [-1, 2, A2C2f, [512, False, -1]]                # 12  P4 intermediate
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]      # 13
+  - [[-1, 4, 9], 1, Concat, [1]]                    # 14  P3 + HF skip
+  - [-1, 2, A2C2f, [256, False, -1]]                # 15  P3 detect
+
+  # PAN bottom-up
+  - [-1, 1, Conv, [256, 3, 2]]                      # 16
+  - [[-1, 12], 1, Concat, [1]]                      # 17
+  - [-1, 2, A2C2f, [512, False, -1]]                # 18  P4 detect
+
+  - [-1, 1, Conv, [512, 3, 2]]                      # 19
+  - [[-1, 8], 1, Concat, [1]]                       # 20
+  - [-1, 2, C3k2, [1024, True]]                     # 21  P5 detect
+
+  - [[15, 18, 21], 1, Detect, [nc]]                 # P3, P4, P5
