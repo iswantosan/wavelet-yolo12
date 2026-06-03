@@ -388,6 +388,28 @@ class TextureGate(nn.Module):
         gate = 2.0 * torch.sigmoid(logits)                     # init = 1.0
         return x * gate
 
+    def __deepcopy__(self, memo):
+        """Reset ``last_logits`` on the copy.
+
+        DetectionModel.__init__ runs a forward pass (in default training
+        mode) to compute strides, which stores a non-leaf logits tensor on
+        this module. The trainer then deepcopies the model for EMA setup,
+        and torch refuses to deepcopy non-leaf tensors. We override
+        deepcopy to skip the offending attribute — ``last_logits`` is
+        recomputed on every training forward, so dropping it on copy is
+        always safe.
+        """
+        import copy
+
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+        for k, v in self.__dict__.items():
+            if k == "last_logits":
+                new.__dict__[k] = None
+            else:
+                new.__dict__[k] = copy.deepcopy(v, memo)
+        return new
+
 
 __all__ = (
     "HaarDWT",

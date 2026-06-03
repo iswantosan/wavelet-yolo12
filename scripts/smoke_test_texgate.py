@@ -85,6 +85,19 @@ def main() -> int:
             print(f"  gate {i}: last_logits shape = {tuple(m.last_logits.shape)}")
             assert m.last_logits.dim() == 4 and m.last_logits.shape[1] == 1
 
+    section("[3.5] Deepcopy works after training-mode forward (trainer EMA path)")
+    # Regression check: torch refuses to deepcopy non-leaf tensors. A naive
+    # implementation that stores logits as a regular attribute breaks the
+    # trainer's EMA setup with `RuntimeError: Only Tensors created
+    # explicitly by the user (graph leaves) support the deepcopy protocol`.
+    from copy import deepcopy as _deepcopy
+    try:
+        _ = _deepcopy(texgate)
+        print("  PASS: deepcopy of texgate after train-forward succeeded")
+    except RuntimeError as e:
+        print(f"  FAIL: deepcopy raised RuntimeError: {e}")
+        raise
+
     section("[4] init_criterion picks v8DetectionLossWithTexGate")
     # DetectionModel needs .args for the loss; emulate the trainer.
     from types import SimpleNamespace
