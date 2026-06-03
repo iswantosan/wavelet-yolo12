@@ -73,6 +73,12 @@ from ultralytics.nn.modules import (
     WaveHFSkip,
     WaveUp,
     AKConv,
+    StripAttention,
+    StripAttnBlock,
+    CA,
+    SFF,
+    DSConv,
+    DSConvBlock,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1011,6 +1017,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             WaveAttnDownV3,
             WaveHFSkip,
             AKConv,
+            StripAttention,
+            StripAttnBlock,
+            CA,
+            DSConv,
+            DSConvBlock,
         }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
@@ -1081,6 +1092,15 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is WaveUp:
             c2 = ch[f]
             args = [c2, *args]
+        elif m is SFF:
+            # SFF expects [high_res, low_res] feature inputs.
+            # f must be a list of two source indices.
+            assert isinstance(f, (list, tuple)) and len(f) == 2, (
+                f"SFF requires f=[high_res_idx, low_res_idx], got {f}"
+            )
+            c1 = [ch[f[0]], ch[f[1]]]
+            c2 = args[0] if args else ch[f[0]]
+            args = [c1, c2, *args[1:]]
         else:
             c2 = ch[f]
 

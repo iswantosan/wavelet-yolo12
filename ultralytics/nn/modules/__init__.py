@@ -89,6 +89,9 @@ from .transformer import (
     TransformerLayer,
 )
 from .akconv import AKConv
+from .dsconv import DSConv, DSConvBlock
+from .hs_fpn import CA, SFF
+from .strip_attn import StripAttention, StripAttnBlock
 from .wavelet import HaarDWT, WaveAttnDown, WaveAttnDownV2, WaveAttnDownV3, WaveDown, WaveHFSkip, WaveUp
 
 __all__ = (
@@ -173,4 +176,10 @@ __all__ = (
     "WaveHFSkip",
     "WaveUp",
     "AKConv",
+    "StripAttention",
+    "StripAttnBlock",
+    "CA",
+    "SFF",
+    "DSConv",
+    "DSConvBlock",
 )
