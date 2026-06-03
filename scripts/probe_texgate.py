@@ -146,7 +146,7 @@ def main() -> int:
     captured: dict[str, torch.Tensor] = {}
 
     def make_hook(name):
-        def hook(_mod, inp, _out):
+        def hook(_mod, inp):
             captured[name] = inp[0].detach()
         return hook
 
