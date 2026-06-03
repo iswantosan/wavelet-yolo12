@@ -174,6 +174,104 @@ class KeypointLoss(nn.Module):
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
 
+class v8DetectionLossWithTexGate:
+    """v8DetectionLoss + auxiliary BCE supervision on TextureGate modules.
+
+    Designed for the Chen-split AFB diagnosis (2026-06-03): baseline bottleneck
+    is hard-negative discrimination on textured/smear backgrounds. TextureGate
+    modules sit before the Detect head's per-scale inputs and learn to gate
+    out background regions. This loss provides the *explicit* supervision
+    signal: gate logits are BCE-targeted against a foreground mask derived
+    from the batch's GT boxes (interior of box = 1, exterior = 0), rescaled
+    to each gate's feature-map resolution.
+
+    Hyperparameters (read via h.get / getattr):
+      tex_gate_weight (float, default 0.5) — weight on the aux BCE term in
+          the total loss. Larger → more pressure on the gate; too large
+          starves detection loss.
+      tex_pos_weight  (float, default 4.0) — BCE positive-class weight to
+          counteract the rarity of foreground pixels (bacilli typically
+          occupy <5% of the feature map).
+
+    Returns the same (total_loss, loss_items[3]) shape as v8DetectionLoss
+    so existing logging is undisturbed — aux contribution is folded into
+    the cls loss item for visibility in results.csv.
+    """
+
+    def __init__(self, model, tal_topk=10):
+        # Delegate the standard detection criterion.
+        self._inner = v8DetectionLoss(model, tal_topk=tal_topk)
+        self.device = self._inner.device
+        # Hyperparameters
+        h = model.args
+        self.tex_gate_weight = float(getattr(h, "tex_gate_weight", 0.5) or 0.5)
+        self.tex_pos_weight = float(getattr(h, "tex_pos_weight", 4.0) or 4.0)
+        # Reference to the model so we can find TextureGate modules each call.
+        # Cache the list lazily.
+        self._model_ref = model
+        self._gates_cache: list | None = None
+
+    def _gates(self):
+        if self._gates_cache is None:
+            from ultralytics.nn.modules.wavelet import TextureGate
+            self._gates_cache = [m for m in self._model_ref.modules() if isinstance(m, TextureGate)]
+        return self._gates_cache
+
+    @staticmethod
+    def _build_target_mask(batch, B: int, H: int, W: int, dtype, device) -> torch.Tensor:
+        """Build (B, 1, H, W) foreground mask from batch GT boxes.
+
+        ``batch["bboxes"]`` are normalized cxcywh in [0, 1]; we project them to
+        the gate's feature-map resolution directly (no stride needed)."""
+        mask = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
+        if "bboxes" not in batch or batch["bboxes"].numel() == 0:
+            return mask
+        batch_idx = batch["batch_idx"].long()
+        bboxes = batch["bboxes"]                                  # (N, 4)
+        cx = bboxes[:, 0] * W
+        cy = bboxes[:, 1] * H
+        bw = bboxes[:, 2] * W
+        bh = bboxes[:, 3] * H
+        x1 = (cx - bw / 2).clamp(0, W - 1).long()
+        y1 = (cy - bh / 2).clamp(0, H - 1).long()
+        x2 = (cx + bw / 2).clamp(0, W - 1).long()
+        y2 = (cy + bh / 2).clamp(0, H - 1).long()
+        for i in range(bboxes.shape[0]):
+            b = int(batch_idx[i])
+            mask[b, 0, y1[i]:y2[i] + 1, x1[i]:x2[i] + 1] = 1.0
+        return mask
+
+    def _aux_bce(self, batch) -> torch.Tensor:
+        aux = torch.zeros((), device=self.device)
+        gates = self._gates()
+        if not gates:
+            return aux
+        pos_w = torch.tensor([self.tex_pos_weight], device=self.device)
+        for m in gates:
+            logits = m.last_logits
+            if logits is None:
+                continue
+            B, _, H, W = logits.shape
+            target = self._build_target_mask(batch, B, H, W, logits.dtype, self.device)
+            aux = aux + F.binary_cross_entropy_with_logits(
+                logits, target, pos_weight=pos_w.to(logits.dtype)
+            )
+            m.last_logits = None  # drop reference (graph freed after backward)
+        return aux
+
+    def __call__(self, preds, batch):
+        total_loss, loss_items = self._inner(preds, batch)
+        aux = self._aux_bce(batch)
+        if aux.requires_grad:
+            batch_size = batch["img"].shape[0]
+            total_loss = total_loss + self.tex_gate_weight * aux * batch_size
+            # Fold aux into cls item so it shows up in results.csv without
+            # changing the (3,) shape contract.
+            loss_items = loss_items.clone()
+            loss_items[1] = loss_items[1] + (self.tex_gate_weight * aux).detach()
+        return total_loss, loss_items
+
+
 class v8DetectionLoss:
     """Criterion class for computing training losses."""
 

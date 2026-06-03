@@ -92,7 +92,16 @@ from .akconv import AKConv
 from .dsconv import DSConv, DSConvBlock
 from .hs_fpn import CA, SFF
 from .strip_attn import StripAttention, StripAttnBlock
-from .wavelet import HaarDWT, WaveAttnDown, WaveAttnDownV2, WaveAttnDownV3, WaveDown, WaveHFSkip, WaveUp
+from .wavelet import (
+    HaarDWT,
+    TextureGate,
+    WaveAttnDown,
+    WaveAttnDownV2,
+    WaveAttnDownV3,
+    WaveDown,
+    WaveHFSkip,
+    WaveUp,
+)
 
 __all__ = (
     "Conv",
@@ -175,6 +184,7 @@ __all__ = (
     "WaveAttnDownV3",
     "WaveHFSkip",
     "WaveUp",
+    "TextureGate",
     "AKConv",
     "StripAttention",
     "StripAttnBlock",

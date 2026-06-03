@@ -328,4 +328,74 @@ class WaveUp(nn.Module):
         return base + self.alpha * residual
 
 
-__all__ = ("HaarDWT", "WaveDown", "WaveAttnDown", "WaveAttnDownV2", "WaveAttnDownV3", "WaveHFSkip", "WaveUp")
+class TextureGate(nn.Module):
+    """Spatial gate that learns to suppress feature activations in textured-
+    background regions.
+
+    Motivated by the Chen-split failure-mode analysis (2026-06-03): the
+    baseline yolov12s bottleneck is not small-object detection or box
+    regression but classifier discrimination on smear/atypical-staining
+    backgrounds (FPs cluster in textured regions, recall ceiling ≈ 92%).
+    Wavelet HF augmentation cannot help because the HF prior SNR is too low
+    (in/out box energy ratio ≈ 1.5×).
+
+    This module attacks the bottleneck directly:
+        gate(x, y) = 2·σ(Conv3×3 → BN → SiLU → Conv1×1 (x))
+        out        = input * gate
+
+    Trained via two gradient sources:
+      1. Implicit: the downstream detection loss flows back through the
+         gated feature.
+      2. Explicit (auxiliary BCE): the gate logits are weakly supervised by
+         a foreground mask derived from batch GT boxes — gate should be high
+         (≈1) inside boxes (bacilli) and low outside. This is wired up in
+         ``v8DetectionLossWithTexGate`` which reads ``last_logits`` after
+         each forward pass.
+
+    Identity init: zero-out last conv → logits = 0 → 2·σ(0) = 1.0 →
+    gated_feature ≡ input_feature at step 0. The model behaves exactly like
+    the baseline before the gate learns anything, so this block has a
+    graceful floor — it cannot degrade the model architecturally.
+    """
+
+    def __init__(self, c1: int, c2: int | None = None):
+        # parse_model always emits (c_in, c_out, *args); a TextureGate
+        # preserves channel count so c1 must equal c2 when both supplied.
+        super().__init__()
+        if c2 is not None and c2 != c1:
+            raise ValueError(
+                f"TextureGate preserves channels but got c1={c1}, c2={c2}. "
+                "Set the YAML output channels equal to the source layer's output."
+            )
+        c = c1
+        c_mid = max(c // 4, 16)
+        self.head = nn.Sequential(
+            nn.Conv2d(c, c_mid, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c_mid),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c_mid, 1, 1, bias=True),
+        )
+        # Identity init: zero last conv → logits=0 → 2·sigmoid(0)=1 → no-op gate.
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+        # Populated during training forward so the aux loss can read it.
+        self.last_logits: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        logits = self.head(x)                                  # (B, 1, H, W)
+        if self.training:
+            self.last_logits = logits                          # kept for aux loss
+        gate = 2.0 * torch.sigmoid(logits)                     # init = 1.0
+        return x * gate
+
+
+__all__ = (
+    "HaarDWT",
+    "WaveDown",
+    "WaveAttnDown",
+    "WaveAttnDownV2",
+    "WaveAttnDownV3",
+    "WaveHFSkip",
+    "WaveUp",
+    "TextureGate",
+)

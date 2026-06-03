@@ -66,6 +66,7 @@ from ultralytics.nn.modules import (
     WorldDetect,
     v10Detect,
     A2C2f,
+    TextureGate,
     WaveAttnDown,
     WaveAttnDownV2,
     WaveAttnDownV3,
@@ -398,8 +399,18 @@ class DetectionModel(BaseModel):
         return y
 
     def init_criterion(self):
-        """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        """Initialize the loss criterion for the DetectionModel.
+
+        When the parsed model contains any ``TextureGate`` module, switch to
+        ``v8DetectionLossWithTexGate`` which adds an auxiliary BCE
+        supervision term on the gate logits.
+        """
+        if getattr(self, "end2end", False):
+            return E2EDetectLoss(self)
+        if any(isinstance(m, TextureGate) for m in self.modules()):
+            from ultralytics.utils.loss import v8DetectionLossWithTexGate
+            return v8DetectionLossWithTexGate(self)
+        return v8DetectionLoss(self)
 
 
 class OBBModel(DetectionModel):
@@ -1016,6 +1027,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             WaveAttnDownV2,
             WaveAttnDownV3,
             WaveHFSkip,
+            TextureGate,
             AKConv,
             StripAttention,
             StripAttnBlock,
