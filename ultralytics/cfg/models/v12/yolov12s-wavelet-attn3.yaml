@@ -1,0 +1,61 @@
+# Wavelet-YOLOv12s — Strategy A v3: WaveAttnDownV3 at P3 transition.
+#
+# Comparison vs prior wavelet-attention variants:
+#   v1 (WaveAttnDown)   : main + sigmoid(BN(Conv1x1(HF))) gated by scalar α (init 0)
+#                         → α=0 traps the gradient to hf_proj; wavelet branch
+#                         struggles to grow. Empirical: tied with baseline.
+#   v2 (WaveAttnDownV2) : main + 3×3→1×1 conv-BN-SiLU additive residual on HF
+#                         → no gating, full-capacity parallel feature path.
+#                         Empirical: underperforms baseline (capacity bloat).
+#   v3 (WaveAttnDownV3) : main · 2·σ(Conv3x3(HF_energy))  (~10 params total)
+#                         → pure spatial gate driven by HF energy prior.
+#                         Init: Conv3x3 weight=bias=0 → gate=1.0 → output =
+#                         main path exactly. Gradient to the gate flows from
+#                         step 0 (no zero-init bottleneck).
+#
+# Hypothesis: bacilli localize where HF energy is locally elevated. A minimal-
+# capacity spatial gate exploiting this prior should act as task-aligned
+# regularisation without interfering with the pretrained main path. Avoids the
+# capacity/interference issues of v1 (gradient trap) and v2 (parallel feature
+# path competing with pretrained conv).
+#
+# Filename suffix 's' is parsed by Ultralytics regex 'yolov?\d+([nslmx])'
+# so scale='s' is auto-detected.
+
+nc: 80
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  - [-1, 1, Conv,           [64, 3, 2]]               # 0-P1/2
+  - [-1, 1, Conv,           [128, 3, 2, 1, 2]]        # 1-P2/4
+  - [-1, 2, C3k2,           [256, False, 0.25]]       # 2
+  - [-1, 1, WaveAttnDownV3, [256, 3, 2]]              # 3-P3/8  (wavelet attn v3)
+  - [-1, 2, C3k2,           [512, False, 0.25]]       # 4
+  - [-1, 1, Conv,           [512, 3, 2]]              # 5-P4/16
+  - [-1, 4, A2C2f,          [512, True, 4]]           # 6
+  - [-1, 1, Conv,           [1024, 3, 2]]             # 7-P5/32
+  - [-1, 4, A2C2f,          [1024, True, 1]]          # 8
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]      # 9
+  - [[-1, 6], 1, Concat, [1]]                       # 10
+  - [-1, 2, A2C2f, [512, False, -1]]                # 11
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]      # 12
+  - [[-1, 4], 1, Concat, [1]]                       # 13
+  - [-1, 2, A2C2f, [256, False, -1]]                # 14  P3 detect
+
+  - [-1, 1, Conv, [256, 3, 2]]                      # 15
+  - [[-1, 11], 1, Concat, [1]]                      # 16
+  - [-1, 2, A2C2f, [512, False, -1]]                # 17  P4 detect
+
+  - [-1, 1, Conv, [512, 3, 2]]                      # 18
+  - [[-1, 8], 1, Concat, [1]]                       # 19
+  - [-1, 2, C3k2, [1024, True]]                     # 20  P5 detect
+
+  - [[14, 17, 20], 1, Detect, [nc]]                 # P3, P4, P5
