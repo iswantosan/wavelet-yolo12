@@ -15,7 +15,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect", "WaveRegDetectP3"
 
 
 class Detect(nn.Module):
@@ -393,18 +393,28 @@ class WaveRegDetect(Detect):
     regression branch (cv2) sees an HF-enriched variant produced by
     WaveRegInjector. Motivated by failure-mode analysis on Chen-TB6208 where
     the bottleneck is box-regression precision (mean IoU 0.683, mAP@0.9≈0).
+
+    Subclasses can override ``inject_scales`` to skip injection at specific
+    scales (e.g. WaveRegDetectP3 injects only at P3 where probe SNR=1.92×).
     """
+
+    # Per-scale injection control. True = wavelet injection, False = bypass.
+    # Default: inject at all 3 scales (P3, P4, P5). Subclasses override.
+    inject_scales = (True, True, True)
 
     def __init__(self, nc=80, ch=()):
         super().__init__(nc, ch)
         from .wavelet import WaveRegInjector
-        self.wavereg = nn.ModuleList(WaveRegInjector(c) for c in ch)
+        self.wavereg = nn.ModuleList(
+            WaveRegInjector(c) if active else nn.Identity()
+            for c, active in zip(ch, self.inject_scales[: len(ch)])
+        )
 
     def forward(self, x):
         if self.end2end:
             return self.forward_end2end(x)
         for i in range(self.nl):
-            x_reg = self.wavereg[i](x[i])
+            x_reg = self.wavereg[i](x[i]) if self.inject_scales[i] else x[i]
             x[i] = torch.cat((self.cv2[i](x_reg), self.cv3[i](x[i])), 1)
         if self.training:
             return x
@@ -415,16 +425,28 @@ class WaveRegDetect(Detect):
         x_detach = [xi.detach() for xi in x]
         one2one = []
         for i in range(self.nl):
-            x_reg_d = self.wavereg[i](x_detach[i])
+            x_reg_d = self.wavereg[i](x_detach[i]) if self.inject_scales[i] else x_detach[i]
             one2one.append(torch.cat((self.one2one_cv2[i](x_reg_d), self.one2one_cv3[i](x_detach[i])), 1))
         for i in range(self.nl):
-            x_reg = self.wavereg[i](x[i])
+            x_reg = self.wavereg[i](x[i]) if self.inject_scales[i] else x[i]
             x[i] = torch.cat((self.cv2[i](x_reg), self.cv3[i](x[i])), 1)
         if self.training:
             return {"one2many": x, "one2one": one2one}
         y = self._inference(one2one)
         y = self.postprocess(y.permute(0, 2, 1), self.max_det, self.nc)
         return y if self.export else (y, {"one2many": x, "one2one": one2one})
+
+
+class WaveRegDetectP3(WaveRegDetect):
+    """WaveReg-Head variant: inject HF ONLY at P3 scale.
+
+    Motivated by probe SNR analysis (2026-06-04) showing P3=1.92×, P4=1.65×,
+    P5=0.95× ratio of GT-vs-background HF energy. P5 has effectively no
+    signal — injecting there in V2 (all-scales) appears to have biased the
+    model toward precision (P↑) at cost of recall (R↓), net mAP loss.
+    This variant restricts HF to the scale with strongest empirical signal.
+    """
+    inject_scales = (True, False, False)
 
 
 class Pose(Detect):

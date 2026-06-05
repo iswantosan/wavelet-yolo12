@@ -75,7 +75,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
-from .head import OBB, Classify, Detect, DyHeadDetect, Pose, RTDETRDecoder, Segment, WaveRegDetect, WorldDetect, v10Detect
+from .head import OBB, Classify, Detect, DyHeadDetect, Pose, RTDETRDecoder, Segment, WaveRegDetect, WaveRegDetectP3, WorldDetect, v10Detect
 from .transformer import (
     AIFI,
     MLP,
@@ -161,6 +161,7 @@ __all__ = (
     "v10Detect",
     "DyHeadDetect",
     "WaveRegDetect",
+    "WaveRegDetectP3",
     "WaveRegInjector",
     "ImagePoolingAttn",
     "ContrastiveHead",
