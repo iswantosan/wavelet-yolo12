@@ -420,4 +420,66 @@ __all__ = (
     "WaveHFSkip",
     "WaveUp",
     "TextureGate",
+    "WaveRegInjector",
 )
+
+
+class WaveRegInjector(nn.Module):
+    """Injects HF wavelet sub-bands into the regression-branch input of a YOLO head.
+
+    Motivated by failure-mode analysis (Chen-TB6208, 2026-06-04): the baseline
+    bottleneck is box-regression precision (mean IoU 0.683, mAP@0.9 ≈ 0.01),
+    not detection or hard-neg classification. HF probe at neck output shows
+    GT-vs-background SNR of 1.92×/1.65×/0.95× at P3/P4/P5 respectively, so HF
+    carries useful boundary signal especially at fine scales. This module
+    routes that HF signal **into the regression branch only**, leaving the
+    classification branch untouched.
+
+    Design choices to avoid prior failure modes:
+    - Uses concat-fusion (not gated residual) → no learnable α that can
+      collapse to ~0 (the α-trap that killed WaveAttnDown v1).
+    - Warm-init: step-0 output ≈ x (LL identity path), HF branch contributes
+      ~0 at init but receives gradients. The head can choose to start using
+      HF as soon as it helps.
+
+    Args:
+        c: input/output channels (preserved).
+    """
+
+    def __init__(self, c: int):
+        super().__init__()
+        self.c = c
+        self.dwt = HaarDWT(c)
+        # Project HF sub-bands (LH, HL, HH = 3C) → C at half resolution.
+        self.proj_hf = nn.Conv2d(3 * c, c, 1, bias=False)
+        # Fusion 1×1 conv: input is concat(x, hf_up) = 2C → C.
+        self.fuse = nn.Sequential(
+            nn.Conv2d(2 * c, c, 1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(inplace=True),
+        )
+        self._warm_init()
+
+    def _warm_init(self) -> None:
+        with torch.no_grad():
+            # HF projection starts at 0 — step-0 HF contribution is 0.
+            nn.init.zeros_(self.proj_hf.weight)
+            # Fuse 1×1 conv: identity on first C input channels (the x stream),
+            # small Kaiming on remaining C channels (the HF stream) so grads
+            # still flow back to proj_hf.
+            w = self.fuse[0].weight  # (C, 2C, 1, 1)
+            w.zero_()
+            c_out = self.fuse[0].out_channels
+            for i in range(c_out):
+                w[i, i, 0, 0] = 1.0
+            hf_block = w[:, c_out:, :, :]
+            if hf_block.numel() > 0:
+                nn.init.kaiming_uniform_(hf_block, a=5 ** 0.5)
+                hf_block.mul_(1e-2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        sub = self.dwt(x)                                          # (B, 4, C, H/2, W/2)
+        hf = sub[:, 1:].flatten(1, 2)                              # (B, 3C, H/2, W/2)
+        hf = self.proj_hf(hf)                                      # (B, C, H/2, W/2)
+        hf_up = F.interpolate(hf, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        return self.fuse(torch.cat([x, hf_up], dim=1))             # (B, C, H, W)

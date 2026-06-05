@@ -15,7 +15,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect"
 
 
 class Detect(nn.Module):
@@ -384,6 +384,47 @@ class OBB(Detect):
     def decode_bboxes(self, bboxes, anchors):
         """Decode rotated bounding boxes."""
         return dist2rbox(bboxes, self.angle, anchors, dim=1)
+
+
+class WaveRegDetect(Detect):
+    """YOLO Detect head with wavelet-HF injection routed to the regression branch only.
+
+    The classification branch (cv3) sees the original neck feature; the
+    regression branch (cv2) sees an HF-enriched variant produced by
+    WaveRegInjector. Motivated by failure-mode analysis on Chen-TB6208 where
+    the bottleneck is box-regression precision (mean IoU 0.683, mAP@0.9≈0).
+    """
+
+    def __init__(self, nc=80, ch=()):
+        super().__init__(nc, ch)
+        from .wavelet import WaveRegInjector
+        self.wavereg = nn.ModuleList(WaveRegInjector(c) for c in ch)
+
+    def forward(self, x):
+        if self.end2end:
+            return self.forward_end2end(x)
+        for i in range(self.nl):
+            x_reg = self.wavereg[i](x[i])
+            x[i] = torch.cat((self.cv2[i](x_reg), self.cv3[i](x[i])), 1)
+        if self.training:
+            return x
+        y = self._inference(x)
+        return y if self.export else (y, x)
+
+    def forward_end2end(self, x):
+        x_detach = [xi.detach() for xi in x]
+        one2one = []
+        for i in range(self.nl):
+            x_reg_d = self.wavereg[i](x_detach[i])
+            one2one.append(torch.cat((self.one2one_cv2[i](x_reg_d), self.one2one_cv3[i](x_detach[i])), 1))
+        for i in range(self.nl):
+            x_reg = self.wavereg[i](x[i])
+            x[i] = torch.cat((self.cv2[i](x_reg), self.cv3[i](x[i])), 1)
+        if self.training:
+            return {"one2many": x, "one2one": one2one}
+        y = self._inference(one2one)
+        y = self.postprocess(y.permute(0, 2, 1), self.max_det, self.nc)
+        return y if self.export else (y, {"one2many": x, "one2one": one2one})
 
 
 class Pose(Detect):

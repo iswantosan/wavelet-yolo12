@@ -75,7 +75,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
-from .head import OBB, Classify, Detect, DyHeadDetect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
+from .head import OBB, Classify, Detect, DyHeadDetect, Pose, RTDETRDecoder, Segment, WaveRegDetect, WorldDetect, v10Detect
 from .transformer import (
     AIFI,
     MLP,
@@ -100,6 +100,7 @@ from .wavelet import (
     WaveAttnDownV3,
     WaveDown,
     WaveHFSkip,
+    WaveRegInjector,
     WaveUp,
 )
 
@@ -159,6 +160,8 @@ __all__ = (
     "WorldDetect",
     "v10Detect",
     "DyHeadDetect",
+    "WaveRegDetect",
+    "WaveRegInjector",
     "ImagePoolingAttn",
     "ContrastiveHead",
     "BNContrastiveHead",
