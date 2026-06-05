@@ -30,7 +30,7 @@ from PIL import Image
 CLASS_NAME = "bacilli"          # single foreground class in TB6208
 CLASS_ID = 0
 N_TRAIN, N_VAL, N_TEST = 1024, 140, 101
-SPLIT_SEED = 42                 # do not change — must match Chen et al. baseline
+DEFAULT_SPLIT_SEED = 42         # default matches Chen et al. baseline; override with --seed
 
 
 def maybe_extract(zip_path: Path, extract_dir: Path, expected: Path) -> None:
@@ -89,7 +89,7 @@ def place(img: Path, lbl_txt: Path, split_dir: Path, use_symlink: bool) -> None:
         shutil.copy2(lbl_txt, dst_lbl)
 
 
-def build_split(src: Path, out: Path, use_symlink: bool, fresh: bool) -> Path:
+def build_split(src: Path, out: Path, use_symlink: bool, fresh: bool, seed: int = DEFAULT_SPLIT_SEED) -> Path:
     images = sorted(p for p in src.rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
     pairs = []
     for img in images:
@@ -110,8 +110,8 @@ def build_split(src: Path, out: Path, use_symlink: bool, fresh: bool) -> Path:
             write_yolo_label(xml, img, lbl)
         img_to_lbl[img] = lbl
 
-    # Deterministic shuffle with the seed locked to Chen split.
-    rng = random.Random(SPLIT_SEED)
+    # Deterministic shuffle with the provided seed (default = Chen baseline 42).
+    rng = random.Random(seed)
     shuffled = [img for img, _ in pairs]
     rng.shuffle(shuffled)
 
@@ -127,7 +127,7 @@ def build_split(src: Path, out: Path, use_symlink: bool, fresh: bool) -> Path:
     train = shuffled[:n_tr]
     val = shuffled[n_tr : n_tr + n_va]
     test = shuffled[n_tr + n_va : n_tr + n_va + n_te]
-    print(f"Split: train={len(train)}  val={len(val)}  test={len(test)}  seed={SPLIT_SEED}")
+    print(f"Split: train={len(train)}  val={len(val)}  test={len(test)}  seed={seed}")
 
     if fresh and out.exists():
         shutil.rmtree(out)
@@ -142,7 +142,7 @@ def build_split(src: Path, out: Path, use_symlink: bool, fresh: bool) -> Path:
     data_yaml = out / "data.yaml"
     data_yaml.write_text(
         "# Chen-style split (Chen et al. IJAI 2024) — 1024/140/101\n"
-        f"# Split seed: {SPLIT_SEED} (deterministic)\n"
+        f"# Split seed: {seed} (deterministic)\n"
         f"path: {out.resolve()}\n"
         "train: train/images\n"
         "val:   val/images\n"
@@ -163,6 +163,10 @@ def main() -> int:
     ap.add_argument("--extract-dir", default=None, help="Where to extract the zip (parent of --src).")
     ap.add_argument("--symlink", action="store_true", help="Symlink instead of copy.")
     ap.add_argument("--keep", action="store_true", help="Do not wipe --out before building.")
+    ap.add_argument(
+        "--seed", type=int, default=DEFAULT_SPLIT_SEED,
+        help=f"Deterministic shuffle seed for train/val/test split (default {DEFAULT_SPLIT_SEED} = Chen baseline).",
+    )
     args = ap.parse_args()
 
     src = Path(args.src)
@@ -174,7 +178,7 @@ def main() -> int:
         print(f"ERROR: src does not exist: {src}", file=sys.stderr)
         return 1
 
-    build_split(src, out, use_symlink=args.symlink, fresh=not args.keep)
+    build_split(src, out, use_symlink=args.symlink, fresh=not args.keep, seed=args.seed)
     return 0
 
 
