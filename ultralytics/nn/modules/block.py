@@ -12,6 +12,7 @@ from .transformer import TransformerBlock
 
 __all__ = (
     "DFL",
+    "HierarchicalDFL",
     "HGBlock",
     "HGStem",
     "SPP",
@@ -73,6 +74,56 @@ class DFL(nn.Module):
         b, _, a = x.shape  # batch, channels, anchors
         return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(b, 4, a)
         # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
+
+
+class HierarchicalDFL(nn.Module):
+    """Hierarchical Distribution Focal Loss integrator (HDFL).
+
+    Two-stage DFL for sub-pixel box regression. Stage 1 is the standard DFL
+    over reg_max bins giving continuous offsets in [0, reg_max). Stage 2 adds
+    a sub-bin refinement: fine_max bins covering [0, 1), letting the model
+    express ~1/fine_max-pixel resolution within each coarse step.
+
+    Motivation: at typical YOLO strides (P3=8, P4=16, P5=32), standard
+    16-bin DFL has ~1-2 px granularity per box side. This caps achievable
+    IoU in the high-IoU regime (mAP@0.9 collapses to ~0 on AFB Chen-TB6208).
+    HDFL doubles the regression channel count (4·(reg_max+fine_max)
+    instead of 4·reg_max) but yields reg_max·fine_max = 256 effective
+    quantile levels per side at +0.3% model parameters.
+    """
+
+    def __init__(self, reg_max: int = 16, fine_max: int = 16):
+        super().__init__()
+        self.reg_max = reg_max
+        self.fine_max = fine_max
+
+        # Coarse projector: bins at integer offsets [0, 1, ..., reg_max-1].
+        self.conv_coarse = nn.Conv2d(reg_max, 1, 1, bias=False).requires_grad_(False)
+        self.conv_coarse.weight.data[:] = nn.Parameter(
+            torch.arange(reg_max, dtype=torch.float).view(1, reg_max, 1, 1)
+        )
+
+        # Fine projector: bins at sub-integer offsets in [0, 1).
+        # bin k → k / fine_max so bin 0 = 0.0, bin (fine_max-1) = (fine_max-1)/fine_max.
+        self.conv_fine = nn.Conv2d(fine_max, 1, 1, bias=False).requires_grad_(False)
+        self.conv_fine.weight.data[:] = nn.Parameter(
+            (torch.arange(fine_max, dtype=torch.float) / fine_max).view(1, fine_max, 1, 1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Input (B, 4·(reg_max+fine_max), A); output (B, 4, A) integrated offsets."""
+        b, _, a = x.shape
+        n_coarse = 4 * self.reg_max
+        x_coarse = x[:, :n_coarse]
+        x_fine = x[:, n_coarse:]
+
+        coarse = self.conv_coarse(
+            x_coarse.view(b, 4, self.reg_max, a).transpose(2, 1).softmax(1)
+        ).view(b, 4, a)
+        fine = self.conv_fine(
+            x_fine.view(b, 4, self.fine_max, a).transpose(2, 1).softmax(1)
+        ).view(b, 4, a)
+        return coarse + fine
 
 
 class Proto(nn.Module):

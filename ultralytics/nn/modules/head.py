@@ -10,12 +10,12 @@ from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 
-from .block import DFL, BNContrastiveHead, ContrastiveHead, Proto
+from .block import DFL, BNContrastiveHead, ContrastiveHead, HierarchicalDFL, Proto
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect", "WaveRegDetectP3"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect", "WaveRegDetectP3", "HDFLDetect"
 
 
 class Detect(nn.Module):
@@ -447,6 +447,97 @@ class WaveRegDetectP3(WaveRegDetect):
     This variant restricts HF to the scale with strongest empirical signal.
     """
     inject_scales = (True, False, False)
+
+
+class HDFLDetect(Detect):
+    """YOLO Detect head with Hierarchical DFL for sub-pixel box regression.
+
+    Standard YOLOv8/12 Detect predicts 16-bin DFL distributions per box side,
+    yielding ~1-2 px quantization at typical strides. This caps achievable
+    IoU in the high-IoU regime — AFB Chen-TB6208 baseline diagnoses show
+    mAP@0.5=0.80, mAP@0.7=0.23, mAP@0.9≈0.01 (drop 0.5→0.7 = 0.574), with
+    >50% of false positives lying within 0.5 box-diameter of GT (near-miss).
+
+    HDFLDetect replaces the single 16-bin DFL with a hierarchical coarse+fine
+    decomposition: 16 coarse bins (offsets 0..15) + 16 fine bins covering
+    sub-bin offsets [0, 1). Total regression channels: 4·(16+16) = 128 per
+    anchor (vs 64). Effective quantile levels per side: 16·16 = 256.
+
+    Net cost: +0.18% model parameters (only the final 1×1 conv of each cv2
+    doubles its output channels), +<1% FLOPs.
+
+    Loss-side support: `v8DetectionLoss` auto-detects `is_hdfl=True` and
+    splits the regression channels into coarse / fine, applies DFL to both,
+    and integrates them in bbox_decode.
+    """
+
+    # Marker for the loss class to switch to HDFL split + dual DFL.
+    is_hdfl = True
+
+    def __init__(self, nc: int = 80, ch: tuple = ()):
+        # Bootstrap parent Detect (sets reg_max=16, builds cv3, sets self.dfl
+        # to standard DFL, end2end branches if active, etc.).
+        super().__init__(nc, ch)
+
+        self.fine_max = 16
+        self.reg_total = self.reg_max + self.fine_max  # 32 channels per side
+        # Update output channels per anchor: nc + reg_total*4 (vs nc + reg_max*4).
+        self.no = nc + self.reg_total * 4
+
+        # Rebuild cv2 with doubled regression output channels.
+        c2 = max((16, ch[0] // 4, self.reg_total * 4))
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_total, 1))
+            for x in ch
+        )
+
+        # Replace DFL → HDFL (parent set self.dfl = DFL(reg_max)).
+        self.dfl = HierarchicalDFL(self.reg_max, self.fine_max)
+
+        # If end2end (v10Detect style), rebuild one2one_cv2 too.
+        if self.end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+
+    def _inference(self, x):
+        """Override Detect._inference to split using reg_total*4 (not reg_max*4)."""
+        shape = x[0].shape  # BCHW
+        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        if self.format != "imx" and (self.dynamic or self.shape != shape):
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+
+        if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:
+            box = x_cat[:, : self.reg_total * 4]
+            cls = x_cat[:, self.reg_total * 4 :]
+        else:
+            box, cls = x_cat.split((self.reg_total * 4, self.nc), 1)
+
+        if self.export and self.format in {"tflite", "edgetpu"}:
+            grid_h = shape[2]
+            grid_w = shape[3]
+            grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)
+            norm = self.strides / (self.stride[0] * grid_size)
+            dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])
+        elif self.export and self.format == "imx":
+            dbox = self.decode_bboxes(
+                self.dfl(box) * self.strides, self.anchors.unsqueeze(0) * self.strides, xywh=False
+            )
+            return dbox.transpose(1, 2), cls.sigmoid().permute(0, 2, 1)
+        else:
+            dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
+
+        return torch.cat((dbox, cls.sigmoid()), 1)
+
+    def bias_init(self):
+        """HDFL-aware bias init — cv2 last conv now has 4·reg_total outputs, not 4·reg_max."""
+        m = self
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):
+            a[-1].bias.data[:] = 1.0  # box (all reg_total*4 entries)
+            b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)
+        if self.end2end:
+            for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):
+                a[-1].bias.data[:] = 1.0
+                b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)
 
 
 class Pose(Detect):

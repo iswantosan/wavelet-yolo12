@@ -102,15 +102,26 @@ class BboxLoss(nn.Module):
     pixel-discretised IoU is unstable.
     """
 
-    def __init__(self, reg_max=16, nwd_ratio=0.0, nwd_c=12.8):
-        """Initialize the BboxLoss module with regularization maximum and DFL settings."""
+    def __init__(self, reg_max=16, nwd_ratio=0.0, nwd_c=12.8, fine_max=0):
+        """Initialize the BboxLoss module with regularization maximum and DFL settings.
+
+        Args:
+            reg_max: coarse DFL bin count.
+            nwd_ratio, nwd_c: optional NWD blend (unchanged behaviour at 0).
+            fine_max: if > 0, enable HDFL (Hierarchical DFL). Coarse DFL on
+                first reg_max·4 channels + Fine DFL on next fine_max·4
+                channels, target sub-bin offset.
+        """
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.fine_dfl_loss = DFLoss(fine_max) if fine_max > 1 else None
+        self.reg_max = reg_max
+        self.fine_max = fine_max
         self.nwd_ratio = float(nwd_ratio)
         self.nwd_c = float(nwd_c)
 
     def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
-        """IoU loss (with optional NWD blend)."""
+        """IoU loss (with optional NWD blend) + DFL (with optional HDFL fine stage)."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
@@ -124,9 +135,23 @@ class BboxLoss(nn.Module):
 
         # DFL loss
         if self.dfl_loss:
-            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
-            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
-            loss_dfl = loss_dfl.sum() / target_scores_sum
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max - 1)
+            if self.fine_dfl_loss is not None:
+                # HDFL: split pred_dist into coarse (4·reg_max) + fine (4·fine_max) channels.
+                pd = pred_dist[fg_mask]                                              # (N, 4·(reg_max+fine_max))
+                coarse = pd[:, : 4 * self.reg_max].reshape(-1, self.reg_max)         # (N·4, reg_max)
+                fine = pd[:, 4 * self.reg_max :].reshape(-1, self.fine_max)          # (N·4, fine_max)
+
+                t_coarse = target_ltrb[fg_mask]                                      # (N, 4) — continuous offsets
+                # Fine target = fractional part of t_coarse, scaled to fine bin position.
+                t_fine = (t_coarse - t_coarse.floor()) * self.fine_max               # (N, 4) in [0, fine_max)
+
+                loss_coarse = self.dfl_loss(coarse, t_coarse) * weight               # (N, 1)
+                loss_fine = self.fine_dfl_loss(fine, t_fine) * weight                # (N, 1)
+                loss_dfl = (loss_coarse + loss_fine).sum() / target_scores_sum
+            else:
+                loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.reg_max), target_ltrb[fg_mask]) * weight
+                loss_dfl = loss_dfl.sum() / target_scores_sum
         else:
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
 
@@ -285,8 +310,14 @@ class v8DetectionLoss:
         self.hyp = h
         self.stride = m.stride  # model strides
         self.nc = m.nc  # number of classes
-        self.no = m.nc + m.reg_max * 4
         self.reg_max = m.reg_max
+        # HDFL support: HDFLDetect sets is_hdfl=True and fine_max>0. Default
+        # behaviour (standard Detect) is unchanged: fine_max=0 → loss
+        # branches stay on the original single-stage DFL path.
+        self.is_hdfl = bool(getattr(m, "is_hdfl", False))
+        self.fine_max = int(getattr(m, "fine_max", 0)) if self.is_hdfl else 0
+        self.reg_total = self.reg_max + self.fine_max
+        self.no = m.nc + self.reg_total * 4
         self.device = device
 
         self.use_dfl = m.reg_max > 1
@@ -297,8 +328,13 @@ class v8DetectionLoss:
         # default cfg schema.
         nwd_ratio = float(h.get("nwd_ratio", 0.0) or 0.0)
         nwd_c = float(h.get("nwd_c", 12.8) or 12.8)
-        self.bbox_loss = BboxLoss(m.reg_max, nwd_ratio=nwd_ratio, nwd_c=nwd_c).to(device)
+        self.bbox_loss = BboxLoss(
+            m.reg_max, nwd_ratio=nwd_ratio, nwd_c=nwd_c, fine_max=self.fine_max
+        ).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        if self.fine_max > 0:
+            # Sub-bin offsets bin k → k / fine_max ∈ [0, 1). Matches HierarchicalDFL.
+            self.proj_fine = torch.arange(self.fine_max, dtype=torch.float, device=device) / self.fine_max
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
@@ -318,12 +354,27 @@ class v8DetectionLoss:
         return out
 
     def bbox_decode(self, anchor_points, pred_dist):
-        """Decode predicted object bounding box coordinates from anchor points and distribution."""
+        """Decode predicted object bounding box coordinates from anchor points and distribution.
+
+        When ``self.fine_max > 0`` (HDFL), splits pred_dist into coarse + fine
+        per-side distributions and integrates both stages; otherwise applies
+        the standard single-stage DFL integration.
+        """
         if self.use_dfl:
             b, a, c = pred_dist.shape  # batch, anchors, channels
-            pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-            # pred_dist = pred_dist.view(b, a, c // 4, 4).transpose(2,3).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-            # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
+            if self.fine_max > 0:
+                # HDFL: c = 4·(reg_max + fine_max).
+                coarse = pred_dist[..., : 4 * self.reg_max]
+                fine = pred_dist[..., 4 * self.reg_max :]
+                coarse_off = (
+                    coarse.view(b, a, 4, self.reg_max).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+                )
+                fine_off = (
+                    fine.view(b, a, 4, self.fine_max).softmax(3).matmul(self.proj_fine.type(pred_dist.dtype))
+                )
+                pred_dist = coarse_off + fine_off
+            else:
+                pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def __call__(self, preds, batch):
@@ -331,7 +382,7 @@ class v8DetectionLoss:
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
+            (self.reg_total * 4, self.nc), 1
         )
 
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
