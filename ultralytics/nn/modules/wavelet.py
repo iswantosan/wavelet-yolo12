@@ -458,24 +458,15 @@ class WaveRegInjector(nn.Module):
             nn.BatchNorm2d(c),
             nn.SiLU(inplace=True),
         )
-        self._warm_init()
-
-    def _warm_init(self) -> None:
-        with torch.no_grad():
-            # HF projection starts at 0 — step-0 HF contribution is 0.
-            nn.init.zeros_(self.proj_hf.weight)
-            # Fuse 1×1 conv: identity on first C input channels (the x stream),
-            # small Kaiming on remaining C channels (the HF stream) so grads
-            # still flow back to proj_hf.
-            w = self.fuse[0].weight  # (C, 2C, 1, 1)
-            w.zero_()
-            c_out = self.fuse[0].out_channels
-            for i in range(c_out):
-                w[i, i, 0, 0] = 1.0
-            hf_block = w[:, c_out:, :, :]
-            if hf_block.numel() > 0:
-                nn.init.kaiming_uniform_(hf_block, a=5 ** 0.5)
-                hf_block.mul_(1e-2)
+        # v2 init (2026-06-04): standard Kaiming on BOTH proj_hf and fuse.
+        # The prior warm-init (proj_hf=0, fuse_HF=1e-2·Kaiming) caused
+        # gradient starvation — after 60ep training |proj_hf|_max stayed
+        # at ~1.8e-4 across all 3 scales (effectively never used). The
+        # trade-off here: cv2 sees a perturbed-from-pretrained input at
+        # step 0, requiring ~3-5 epochs to recover, in exchange for
+        # guaranteed HF gradient flow.
+        nn.init.kaiming_uniform_(self.proj_hf.weight, a=5 ** 0.5)
+        nn.init.kaiming_uniform_(self.fuse[0].weight, a=5 ** 0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         sub = self.dwt(x)                                          # (B, 4, C, H/2, W/2)
