@@ -318,6 +318,15 @@ class v8DetectionLoss:
         self.fine_max = int(getattr(m, "fine_max", 0)) if self.is_hdfl else 0
         self.reg_total = self.reg_max + self.fine_max
         self.no = m.nc + self.reg_total * 4
+        # AuxSeg support: AuxSegDetect sets is_auxseg=True. The detection
+        # head's training forward then returns a (features_list, seg_logit)
+        # tuple — see AuxSegDetect.forward. We supervise the seg_logit with
+        # a pseudo-mask derived from LAB a*-channel approximation of
+        # batch["img"] AND-ed with inflated GT boxes.
+        self.is_auxseg = bool(getattr(m, "is_auxseg", False))
+        self.auxseg_weight = float(h.get("auxseg_weight", 1.0) or 1.0) if self.is_auxseg else 0.0
+        if self.is_auxseg:
+            self.bce_seg = nn.BCEWithLogitsLoss(reduction="mean")
         self.device = device
 
         self.use_dfl = m.reg_max > 1
@@ -335,6 +344,66 @@ class v8DetectionLoss:
         if self.fine_max > 0:
             # Sub-bin offsets bin k → k / fine_max ∈ [0, 1). Matches HierarchicalDFL.
             self.proj_fine = torch.arange(self.fine_max, dtype=torch.float, device=device) / self.fine_max
+
+    def make_auxseg_target(self, img: torch.Tensor, gt_xyxy_per_image: list, mask_shape: tuple) -> torch.Tensor:
+        """Generate AFB-specific pseudo-mask from input image batch.
+
+        Uses LAB a*-channel approximation (R−G) — high-a* pixels are the
+        Ziehl-Neelsen-stained bacilli (pink/red), low-a* pixels are the
+        methylene-blue background. Per-image adaptive threshold via the
+        70th percentile of a*, then AND with inflated GT boxes so
+        background red speckles don't leak.
+
+        Args:
+            img: (B, 3, H, W) RGB image tensor, range [0, 1] (post-augment).
+            gt_xyxy_per_image: length-B list, each (n_i, 4) pixel-coord
+                GT boxes (xyxy). Empty list for images without GT.
+            mask_shape: (h_mask, w_mask) target resolution (P3 stride 8).
+
+        Returns:
+            (B, 1, h_mask, w_mask) float pseudo-mask in {0., 1.}.
+        """
+        B, _, H, W = img.shape
+        dev = img.device
+        dtype = img.dtype
+
+        # LAB a* approximation. R−G is the classic red-green opponent; on
+        # ZN-stained microscopy it cleanly separates bacilli (high a*)
+        # from methylene-blue smear (low a*). Cheaper than cv2 in the
+        # GPU loss loop and AMP-safe.
+        a_star = (img[:, 0:1] - img[:, 1:2]).to(dtype)
+
+        # Per-image adaptive threshold = 70th-percentile a* (assumes
+        # bacilli are a minority of pixels).
+        a_flat = a_star.view(B, -1)
+        thresh = a_flat.quantile(0.70, dim=1).view(B, 1, 1, 1)
+        lab_mask = (a_star > thresh).to(dtype)
+
+        # Box-AND: zero out anywhere not inside an inflated GT box.
+        box_mask = torch.zeros((B, 1, H, W), device=dev, dtype=dtype)
+        for i in range(B):
+            boxes = gt_xyxy_per_image[i]
+            if boxes is None or len(boxes) == 0:
+                continue
+            for box in boxes.tolist():
+                x1, y1, x2, y2 = box
+                w_b = max(x2 - x1, 1.0)
+                h_b = max(y2 - y1, 1.0)
+                # 10% inflate on each side to catch boundary halo.
+                px, py = 0.1 * w_b, 0.1 * h_b
+                xi1 = max(0, int(x1 - px))
+                yi1 = max(0, int(y1 - py))
+                xi2 = min(W, int(x2 + px))
+                yi2 = min(H, int(y2 + py))
+                if xi2 > xi1 and yi2 > yi1:
+                    box_mask[i, 0, yi1:yi2, xi1:xi2] = 1.0
+
+        pseudo = lab_mask * box_mask  # AND
+        # Downsample to mask resolution; "area" gives soft coverage which
+        # we re-binarise at 0.2 (any pixel with ≥20% fg in its receptive
+        # field counts as foreground).
+        pseudo_low = F.interpolate(pseudo, size=mask_shape, mode="area")
+        return (pseudo_low > 0.2).to(dtype)
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
@@ -380,7 +449,16 @@ class v8DetectionLoss:
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
-        feats = preds[1] if isinstance(preds, tuple) else preds
+
+        # AuxSegDetect training-mode returns (feats_list, seg_logit). We
+        # disambiguate vs the (inference, raw_feats) tuple used in eval by
+        # checking the first element is a list of feature tensors and the
+        # auxseg marker is set on the head.
+        seg_logit = None
+        if self.is_auxseg and isinstance(preds, tuple) and len(preds) == 2 and isinstance(preds[0], list):
+            feats, seg_logit = preds
+        else:
+            feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_total * 4, self.nc), 1
         )
@@ -430,6 +508,24 @@ class v8DetectionLoss:
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+
+        # AuxSeg auxiliary loss (dense fg/bg BCE) — folded into cls item
+        # so the (3,) loss-item contract stays intact for logging.
+        if seg_logit is not None:
+            img = batch["img"]
+            # gt_bboxes was scaled by scale_tensor in preprocess() to pixel
+            # coords (xyxy). Filter per-image valid rows via mask_gt.
+            gt_xyxy_per_image = []
+            for i in range(batch_size):
+                row = gt_bboxes[i]                          # (max_n, 4) xyxy in pixels
+                m_i = mask_gt[i].squeeze(-1).bool()         # (max_n,)
+                gt_xyxy_per_image.append(row[m_i].detach())
+            mask_shape = seg_logit.shape[-2:]
+            pseudo = self.make_auxseg_target(img.detach(), gt_xyxy_per_image, mask_shape)
+            aux = self.bce_seg(seg_logit, pseudo) * self.auxseg_weight
+            total = (loss.sum() + aux) * batch_size
+            items = torch.stack([loss[0].detach(), loss[1].detach() + aux.detach(), loss[2].detach()])
+            return total, items
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 

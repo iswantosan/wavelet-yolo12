@@ -15,7 +15,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect", "WaveRegDetectP3", "HDFLDetect"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect", "WaveRegDetectP3", "HDFLDetect", "AuxSegDetect"
 
 
 class Detect(nn.Module):
@@ -538,6 +538,57 @@ class HDFLDetect(Detect):
             for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):
                 a[-1].bias.data[:] = 1.0
                 b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)
+
+
+class AuxSegDetect(Detect):
+    """YOLO Detect head augmented with an auxiliary segmentation branch.
+
+    Motivated by val diagnostic on AFB Chen-TB6208 (2026-06-05, baseline
+    val mAP50=0.85) showing that 54.7% of false positives are >2 box-
+    diameters from any ground truth — i.e. hard-negative background
+    confusion (smear / debris / atypical staining) dominates the
+    precision gap, not box-regression near-miss.
+
+    Architecture: in parallel to the standard Detect head, a small
+    ``auxseg`` branch on the P3 neck feature predicts a single-channel
+    foreground-vs-background logit map at P3 resolution (stride 8).
+    During training, ``v8DetectionLoss`` (auto-detects ``is_auxseg=True``)
+    supervises this map with a domain-specific pseudo-mask derived from
+    the input image's LAB a*-channel approximation (R−G) intersected
+    with the inflated GT boxes — exploiting the Ziehl-Neelsen staining
+    invariant that bacilli appear red/pink (high a*) while smear /
+    background appear blue (low a*). The dense supervision pushes the
+    shared backbone toward learning foreground discriminative features
+    at every spatial location, attacking hard-negative FPs directly.
+
+    Cost: +~30k params (negligible), +<1% FLOPs.
+
+    Inference-only: ``auxseg`` is dropped; behaviour identical to Detect.
+    """
+
+    # Marker for v8DetectionLoss to wire in the BCE seg loss branch.
+    is_auxseg = True
+
+    def __init__(self, nc: int = 80, ch: tuple = ()):
+        super().__init__(nc, ch)
+        # AuxSeg head: 2 conv blocks + 1×1 logit on P3 feature (ch[0]).
+        c_in = ch[0]
+        c_mid = max(32, c_in // 4)
+        self.auxseg = nn.Sequential(
+            Conv(c_in, c_mid, 3),
+            Conv(c_mid, c_mid, 3),
+            nn.Conv2d(c_mid, 1, 1),  # raw logit; BCE applies sigmoid internally
+        )
+
+    def forward(self, x):
+        """Train: return (det_features_list, seg_logit). Eval: standard Detect."""
+        if self.training:
+            seg_logit = self.auxseg(x[0])  # supervise on P3-scale feature
+            for i in range(self.nl):
+                x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            return x, seg_logit
+        # Eval / export: skip auxseg branch entirely.
+        return super().forward(x)
 
 
 class Pose(Detect):

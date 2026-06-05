@@ -1,4 +1,4 @@
-"""Smoke test: build HDFL/P3P4 model variants and run a dummy forward pass.
+"""Smoke test: build HDFL / AuxSeg / P3P4 model variants and run dummy forward.
 
 Run: python scripts/smoke_test_hdfl.py
 """
@@ -56,8 +56,11 @@ def _check_loss_compat(cfg: str):
     x = torch.randn(bs, 3, imgsz, imgsz)
     feats = model(x)  # train mode returns list of feature maps
 
-    # Construct dummy targets: 3 boxes total across batch.
+    # Construct dummy targets: 3 boxes total across batch. Include
+    # batch["img"] because AuxSeg loss needs the image tensor for
+    # the LAB a*-channel pseudo-mask.
     batch = {
+        "img": x.clamp(0, 1),  # normalised to [0,1] for LAB a* approx
         "batch_idx": torch.tensor([0.0, 0.0, 1.0]),
         "cls": torch.tensor([[0.0], [1.0], [0.0]]),
         "bboxes": torch.tensor([
@@ -86,20 +89,22 @@ def _check_loss_compat(cfg: str):
 
 
 if __name__ == "__main__":
-    # Tier 1: structural build + forward
-    build_and_probe("ultralytics/cfg/models/v12/yolov12s.yaml")
-    build_and_probe("ultralytics/cfg/models/v12/yolov12s-p3p4.yaml")
-    build_and_probe("ultralytics/cfg/models/v12/yolov12s-hdfl.yaml")
-    build_and_probe("ultralytics/cfg/models/v12/yolov12s-hdfl-p3p4.yaml")
-
-    # Tier 2: loss compatibility (train mode + backward)
-    print("\n=== LOSS COMPATIBILITY ===")
-    for cfg in (
+    CFGS = (
         "ultralytics/cfg/models/v12/yolov12s.yaml",
         "ultralytics/cfg/models/v12/yolov12s-p3p4.yaml",
         "ultralytics/cfg/models/v12/yolov12s-hdfl.yaml",
         "ultralytics/cfg/models/v12/yolov12s-hdfl-p3p4.yaml",
-    ):
+        "ultralytics/cfg/models/v12/yolov12s-auxseg.yaml",
+        "ultralytics/cfg/models/v12/yolov12s-auxseg-p3p4.yaml",
+    )
+
+    # Tier 1: structural build + forward (eval mode)
+    for cfg in CFGS:
+        build_and_probe(cfg)
+
+    # Tier 2: loss compatibility (train mode + backward)
+    print("\n=== LOSS COMPATIBILITY ===")
+    for cfg in CFGS:
         print(f"\n--- {cfg} ---")
         try:
             _check_loss_compat(cfg)
