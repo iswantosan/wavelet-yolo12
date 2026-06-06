@@ -10,12 +10,12 @@ from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 
-from .block import DFL, BNContrastiveHead, ContrastiveHead, HierarchicalDFL, Proto
+from .block import DFL, BNContrastiveHead, ContrastiveHead, ContrastiveProjection, HierarchicalDFL, Proto
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect", "WaveRegDetectP3", "HDFLDetect", "AuxSegDetect"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect", "WaveRegDetectP3", "HDFLDetect", "AuxSegDetect", "ContrastiveDetect", "ContrastiveAuxSegDetect"
 
 
 class Detect(nn.Module):
@@ -588,6 +588,95 @@ class AuxSegDetect(Detect):
                 x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
             return x, seg_logit
         # Eval / export: skip auxseg branch entirely.
+        return super().forward(x)
+
+
+class ContrastiveDetect(Detect):
+    """YOLO Detect head with auxiliary contrastive feature projection.
+
+    Adds an L2-normalised embedding head on the P3 neck feature in parallel
+    to the standard Detect cv2/cv3 branches. During training, the loss class
+    auto-detects `is_contrast=True` and applies a SupCon-style InfoNCE
+    contrastive loss between embedding features sampled inside GT boxes
+    (positives) and outside GT boxes (negatives). The aim is to push
+    bacilli-region features to cluster while pushing background-region
+    features apart, directly attacking the hard-negative confusion that
+    dominates the AFB Chen-TB6208 failure mode (54.7% of FPs are >2
+    box-diameters from any GT).
+
+    Inference: the contrast branch is dropped entirely; behaviour is
+    identical to standard Detect.
+
+    Architecture:
+        - Standard Detect cv2 (regression) + cv3 (classification) preserved.
+        - Adds `self.contrast = ContrastiveProjection(ch[0], c_embed=128)`
+          consuming the P3 (highest-res, finest-detail) neck feature.
+
+    Cost: +~30k params (depending on P3 channel width), +<1% FLOPs.
+    """
+
+    # Marker for v8DetectionLoss to wire the InfoNCE contrastive term.
+    is_contrast = True
+
+    def __init__(self, nc: int = 80, ch: tuple = (), embed_dim: int = 128):
+        super().__init__(nc, ch)
+        self.contrast = ContrastiveProjection(ch[0], c_embed=embed_dim)
+
+    def forward(self, x):
+        """Train: return (det_features_list, contrast_emb). Eval: standard Detect."""
+        if self.training:
+            contrast_emb = self.contrast(x[0])  # (B, c_embed, H/8, W/8)
+            for i in range(self.nl):
+                x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            return x, contrast_emb
+        return super().forward(x)
+
+
+class ContrastiveAuxSegDetect(Detect):
+    """YOLO Detect head with BOTH auxiliary segmentation AND contrastive embedding.
+
+    Combines two diagnostic-driven mechanisms on the same P3 neck feature:
+      1. AuxSeg: dense fg/bg supervision via LAB a* pseudo-mask BCE loss
+         (recall-oriented — lifts recall by attacking missed objects).
+      2. Contrastive: SupCon-style feature clustering with positives sampled
+         from in-GT regions and negatives from outside-GT regions
+         (precision-oriented — lifts precision by attacking hard-neg
+         background confusion at feature level).
+
+    Both mechanisms supervise the SHARED P3 neck feature with complementary
+    signal — AuxSeg = spatial mask supervision, Contrastive = clustering
+    supervision in normalised feature space. Inference: both auxiliary
+    branches dropped, behaviour identical to standard Detect.
+
+    Cost: ~+60k params (auxseg + contrast heads), +<1% FLOPs.
+    """
+
+    # Markers — v8DetectionLoss wires both branches when both are True.
+    is_auxseg = True
+    is_contrast = True
+
+    def __init__(self, nc: int = 80, ch: tuple = (), embed_dim: int = 128):
+        super().__init__(nc, ch)
+        c_in = ch[0]
+
+        # AuxSeg head: 2 conv blocks + 1×1 logit on P3 feature.
+        c_mid = max(32, c_in // 4)
+        self.auxseg = nn.Sequential(
+            Conv(c_in, c_mid, 3),
+            Conv(c_mid, c_mid, 3),
+            nn.Conv2d(c_mid, 1, 1),
+        )
+        # Contrastive projection on P3 feature.
+        self.contrast = ContrastiveProjection(c_in, c_embed=embed_dim)
+
+    def forward(self, x):
+        """Train: return (det_features_list, seg_logit, contrast_emb). Eval: standard."""
+        if self.training:
+            seg_logit = self.auxseg(x[0])           # (B, 1, H/8, W/8)
+            contrast_emb = self.contrast(x[0])      # (B, c_embed, H/8, W/8)
+            for i in range(self.nl):
+                x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            return x, seg_logit, contrast_emb
         return super().forward(x)
 
 

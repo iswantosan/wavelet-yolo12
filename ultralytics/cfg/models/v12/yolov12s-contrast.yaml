@@ -1,0 +1,59 @@
+# YOLOv12 — ContrastiveDetect head (auxiliary InfoNCE feature loss) 🚀, AGPL-3.0
+# Primary novelty proposed by val diagnostic on AFB Chen-TB6208:
+# 54.7% of false positives lie >2 box-diameters from any GT — hard-negative
+# background confusion dominates the precision gap. ContrastiveDetect adds an
+# L2-normalised projection head on P3 neck feature, supervised by a SupCon-style
+# InfoNCE loss between in-GT-box features (positives, further filtered by LAB
+# a*-channel > image median) and outside-GT-box features (negatives, randomly
+# sampled). The loss pushes bacilli-region features to cluster while pushing
+# background-region features apart in embedding space — attacking hard-neg
+# discrimination at the representation level rather than only at the output.
+#
+# Loss-side hyperparameters (override via train kwargs / data.yaml):
+#   contrast_weight : 0.3   (relative weight vs box+cls+dfl)
+#   contrast_temp   : 0.1   (InfoNCE temperature)
+#   contrast_n_neg  : 32    (negatives sampled per image)
+#
+# Inference: contrast branch is dropped (zero overhead at val/test).
+# Cost vs baseline yolov12s: +~30k params, +<1% FLOPs.
+
+# Parameters
+nc: 80
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+# YOLO12-turbo backbone (unchanged)
+backbone:
+  - [-1, 1, Conv,  [64, 3, 2]]
+  - [-1, 1, Conv,  [128, 3, 2, 1, 2]]
+  - [-1, 2, C3k2,  [256, False, 0.25]]
+  - [-1, 1, Conv,  [256, 3, 2, 1, 4]]
+  - [-1, 2, C3k2,  [512, False, 0.25]]
+  - [-1, 1, Conv,  [512, 3, 2]]
+  - [-1, 4, A2C2f, [512, True, 4]]
+  - [-1, 1, Conv,  [1024, 3, 2]]
+  - [-1, 4, A2C2f, [1024, True, 1]]
+
+# Head (unchanged) + ContrastiveDetect (3 scales)
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]]
+  - [-1, 2, A2C2f, [512, False, -1]]
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 2, A2C2f, [256, False, -1]]
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 11], 1, Concat, [1]]
+  - [-1, 2, A2C2f, [512, False, -1]]
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 8], 1, Concat, [1]]
+  - [-1, 2, C3k2, [1024, True]]
+
+  - [[14, 17, 20], 1, ContrastiveDetect, [nc]]   # ContrastiveDetect — InfoNCE on P3 embedding

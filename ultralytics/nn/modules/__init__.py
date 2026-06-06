@@ -27,6 +27,7 @@ from .block import (
     DFL,
     ELAN1,
     HierarchicalDFL,
+    ContrastiveProjection,
     PSA,
     SPP,
     SPPELAN,
@@ -76,7 +77,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
-from .head import OBB, AuxSegDetect, Classify, Detect, DyHeadDetect, HDFLDetect, Pose, RTDETRDecoder, Segment, WaveRegDetect, WaveRegDetectP3, WorldDetect, v10Detect
+from .head import OBB, AuxSegDetect, Classify, ContrastiveAuxSegDetect, ContrastiveDetect, Detect, DyHeadDetect, HDFLDetect, Pose, RTDETRDecoder, Segment, WaveRegDetect, WaveRegDetectP3, WorldDetect, v10Detect
 from .transformer import (
     AIFI,
     MLP,
@@ -167,6 +168,9 @@ __all__ = (
     "HDFLDetect",
     "HierarchicalDFL",
     "AuxSegDetect",
+    "ContrastiveDetect",
+    "ContrastiveAuxSegDetect",
+    "ContrastiveProjection",
     "ImagePoolingAttn",
     "ContrastiveHead",
     "BNContrastiveHead",

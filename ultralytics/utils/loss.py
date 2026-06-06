@@ -327,6 +327,17 @@ class v8DetectionLoss:
         self.auxseg_weight = float(h.get("auxseg_weight", 1.0) or 1.0) if self.is_auxseg else 0.0
         if self.is_auxseg:
             self.bce_seg = nn.BCEWithLogitsLoss(reduction="mean")
+        # Contrastive support: ContrastiveDetect / ContrastiveAuxSegDetect
+        # set is_contrast=True. The head's training forward then returns
+        # a tuple ending with `contrast_emb` (L2-normalised B×c_embed×H×W).
+        # We sample positives from inside GT boxes (further filtered by
+        # LAB a* > image-mean) and negatives from outside GT boxes; an
+        # InfoNCE/SupCon loss pushes positive features to cluster and
+        # negative features to scatter in embedding space.
+        self.is_contrast = bool(getattr(m, "is_contrast", False))
+        self.contrast_weight = float(h.get("contrast_weight", 0.3) or 0.3) if self.is_contrast else 0.0
+        self.contrast_temp = float(h.get("contrast_temp", 0.1) or 0.1) if self.is_contrast else 0.1
+        self.contrast_n_neg = int(h.get("contrast_n_neg", 32) or 32) if self.is_contrast else 0
         self.device = device
 
         self.use_dfl = m.reg_max > 1
@@ -344,6 +355,119 @@ class v8DetectionLoss:
         if self.fine_max > 0:
             # Sub-bin offsets bin k → k / fine_max ∈ [0, 1). Matches HierarchicalDFL.
             self.proj_fine = torch.arange(self.fine_max, dtype=torch.float, device=device) / self.fine_max
+
+    def compute_contrast_loss(
+        self,
+        embedding: torch.Tensor,
+        img: torch.Tensor,
+        gt_xyxy_per_image: list,
+    ) -> torch.Tensor:
+        """SupCon-style InfoNCE loss on per-anchor embeddings.
+
+        For each image:
+          - Positives = embedding pixels whose receptive field centre lies
+            inside any GT box AND has LAB a* (R−G) above the image median
+            (filters background regions inside GT boxes — e.g. methylene-
+            blue smear sharing the GT bounding box but not the actual
+            bacillus pixels).
+          - Negatives = randomly-sampled embedding pixels NOT inside any
+            GT box (`contrast_n_neg` per image).
+
+        Loss is computed across all positives in the batch against all
+        negatives. Each positive's similarity-to-other-positives is the
+        numerator, similarity-to-all-negatives is the denominator (sum
+        of exp).
+
+        Args:
+            embedding: (B, c_embed, h_e, w_e) L2-normalised feature.
+            img: (B, 3, H, W) input image, range [0,1].
+            gt_xyxy_per_image: length-B list of (n_i, 4) GT boxes in
+                pixel coords (xyxy).
+
+        Returns:
+            scalar loss tensor.
+        """
+        B, C, h_e, w_e = embedding.shape
+        H, W = img.shape[-2:]
+        device = embedding.device
+        dtype = embedding.dtype
+
+        # Build the image-space LAB a* threshold mask (binary, H×W).
+        a_star = (img[:, 0:1] - img[:, 1:2]).to(dtype)               # (B, 1, H, W)
+        a_med = a_star.view(B, -1).median(dim=1).values.view(B, 1, 1, 1)
+        lab_pos_mask = (a_star > a_med).to(dtype)                     # (B, 1, H, W)
+        # Downsample to embedding resolution. Use "area" so each output
+        # cell is the fraction of its receptive field that is "redder
+        # than median".
+        lab_pos_mask_e = F.interpolate(lab_pos_mask, size=(h_e, w_e), mode="area")
+        lab_pos_mask_e = (lab_pos_mask_e > 0.5).to(dtype).squeeze(1)  # (B, h_e, w_e)
+
+        # Stride from image-space to embedding-space.
+        sx, sy = W / w_e, H / h_e
+
+        pos_feats = []
+        neg_feats = []
+        for i in range(B):
+            boxes = gt_xyxy_per_image[i]
+            if boxes is None or len(boxes) == 0:
+                continue
+            # Build per-image GT-box mask at embedding resolution.
+            box_mask_e = torch.zeros((h_e, w_e), device=device, dtype=dtype)
+            for box in boxes.tolist():
+                x1, y1, x2, y2 = box
+                xi1 = max(0, int(x1 / sx))
+                yi1 = max(0, int(y1 / sy))
+                xi2 = min(w_e, int(x2 / sx) + 1)
+                yi2 = min(h_e, int(y2 / sy) + 1)
+                if xi2 > xi1 and yi2 > yi1:
+                    box_mask_e[yi1:yi2, xi1:xi2] = 1.0
+            # Positives = in-box AND red-shifted; Negatives = outside box.
+            pos_mask = (box_mask_e * lab_pos_mask_e[i]).bool()
+            neg_mask = (box_mask_e == 0)
+            # Embedding (C, h_e, w_e) → flat (h_e*w_e, C)
+            e_flat = embedding[i].permute(1, 2, 0).reshape(-1, C)     # (h_e*w_e, C)
+            pos_flat_idx = pos_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)
+            neg_flat_idx = neg_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)
+            if pos_flat_idx.numel() == 0 or neg_flat_idx.numel() == 0:
+                continue
+            pos_feats.append(e_flat[pos_flat_idx])
+            # Sample up to n_neg negatives per image to bound memory.
+            if neg_flat_idx.numel() > self.contrast_n_neg:
+                perm = torch.randperm(neg_flat_idx.numel(), device=device)[: self.contrast_n_neg]
+                neg_flat_idx = neg_flat_idx[perm]
+            neg_feats.append(e_flat[neg_flat_idx])
+
+        if not pos_feats or not neg_feats:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        P = torch.cat(pos_feats, dim=0)            # (Np, C) L2-normalised
+        N = torch.cat(neg_feats, dim=0)            # (Nn, C) L2-normalised
+        if P.shape[0] < 2 or N.shape[0] == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Logits = cosine similarity / temperature (dot product since
+        # both already L2-normalised).
+        tau = self.contrast_temp
+        logits_pp = (P @ P.T) / tau                # (Np, Np)
+        logits_pn = (P @ N.T) / tau                # (Np, Nn)
+
+        # SupCon: for each positive anchor p, contrast against all OTHER
+        # positives (numerator) and all negatives (denominator). Exclude
+        # self-similarity from the positive set via diagonal mask.
+        Np = P.shape[0]
+        eye = torch.eye(Np, device=device, dtype=torch.bool)
+        # Numerator: log mean(exp(other_pos))
+        logits_pp_masked = logits_pp.masked_fill(eye, float("-inf"))
+        # Denominator: logsumexp(neg) + logsumexp(other_pos)
+        # Standard SupCon: -log( exp(p·p_other/τ) / sum(exp(p·all_neg/τ) + exp(p·all_other_pos/τ)) )
+        all_neg_lse = torch.logsumexp(
+            torch.cat([logits_pp_masked, logits_pn], dim=1), dim=1
+        )                                          # (Np,)
+        # mean(exp(other_pos)) — for each positive, average across other positives
+        # in log space ≈ logsumexp(other_pos) − log(Np−1).
+        pos_lse = torch.logsumexp(logits_pp_masked, dim=1)            # (Np,)
+        log_prob = pos_lse - all_neg_lse                              # (Np,)
+        return -log_prob.mean()
 
     def make_auxseg_target(self, img: torch.Tensor, gt_xyxy_per_image: list, mask_shape: tuple) -> torch.Tensor:
         """Generate AFB-specific pseudo-mask from input image batch.
@@ -450,13 +574,25 @@ class v8DetectionLoss:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
 
-        # AuxSegDetect training-mode returns (feats_list, seg_logit). We
-        # disambiguate vs the (inference, raw_feats) tuple used in eval by
-        # checking the first element is a list of feature tensors and the
-        # auxseg marker is set on the head.
+        # AuxSegDetect / ContrastiveDetect / ContrastiveAuxSegDetect
+        # training-mode returns one of:
+        #   (feats_list, seg_logit)              ← AuxSeg only
+        #   (feats_list, contrast_emb)           ← Contrast only
+        #   (feats_list, seg_logit, contrast_emb)← AuxSeg + Contrast
+        # We disambiguate vs the (inference, raw_feats) eval tuple by
+        # checking the first element is a list of feature tensors and
+        # the relevant marker is set on the head.
         seg_logit = None
-        if self.is_auxseg and isinstance(preds, tuple) and len(preds) == 2 and isinstance(preds[0], list):
-            feats, seg_logit = preds
+        contrast_emb = None
+        if isinstance(preds, tuple) and len(preds) >= 2 and isinstance(preds[0], list):
+            if self.is_auxseg and self.is_contrast and len(preds) == 3:
+                feats, seg_logit, contrast_emb = preds
+            elif self.is_auxseg and len(preds) == 2:
+                feats, seg_logit = preds
+            elif self.is_contrast and len(preds) == 2:
+                feats, contrast_emb = preds
+            else:
+                feats = preds[0]
         else:
             feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -509,9 +645,10 @@ class v8DetectionLoss:
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        # AuxSeg auxiliary loss (dense fg/bg BCE) — folded into cls item
-        # so the (3,) loss-item contract stays intact for logging.
-        if seg_logit is not None:
+        # AuxSeg auxiliary loss (dense fg/bg BCE) + Contrastive feature
+        # loss. Both folded into the cls item so the (3,) loss-item
+        # contract stays intact for logging.
+        if seg_logit is not None or contrast_emb is not None:
             img = batch["img"]
             # gt_bboxes was scaled by scale_tensor in preprocess() to pixel
             # coords (xyxy). Filter per-image valid rows via mask_gt.
@@ -520,11 +657,19 @@ class v8DetectionLoss:
                 row = gt_bboxes[i]                          # (max_n, 4) xyxy in pixels
                 m_i = mask_gt[i].squeeze(-1).bool()         # (max_n,)
                 gt_xyxy_per_image.append(row[m_i].detach())
-            mask_shape = seg_logit.shape[-2:]
-            pseudo = self.make_auxseg_target(img.detach(), gt_xyxy_per_image, mask_shape)
-            aux = self.bce_seg(seg_logit, pseudo) * self.auxseg_weight
-            total = (loss.sum() + aux) * batch_size
-            items = torch.stack([loss[0].detach(), loss[1].detach() + aux.detach(), loss[2].detach()])
+
+            aux_total = torch.tensor(0.0, device=self.device, dtype=loss.dtype)
+            if seg_logit is not None:
+                mask_shape = seg_logit.shape[-2:]
+                pseudo = self.make_auxseg_target(img.detach(), gt_xyxy_per_image, mask_shape)
+                aux_total = aux_total + self.bce_seg(seg_logit, pseudo) * self.auxseg_weight
+            if contrast_emb is not None:
+                aux_total = aux_total + self.compute_contrast_loss(
+                    contrast_emb, img.detach(), gt_xyxy_per_image
+                ) * self.contrast_weight
+
+            total = (loss.sum() + aux_total) * batch_size
+            items = torch.stack([loss[0].detach(), loss[1].detach() + aux_total.detach(), loss[2].detach()])
             return total, items
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)

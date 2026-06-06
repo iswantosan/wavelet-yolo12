@@ -13,6 +13,7 @@ from .transformer import TransformerBlock
 __all__ = (
     "DFL",
     "HierarchicalDFL",
+    "ContrastiveProjection",
     "HGBlock",
     "HGStem",
     "SPP",
@@ -74,6 +75,45 @@ class DFL(nn.Module):
         b, _, a = x.shape  # batch, channels, anchors
         return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(b, 4, a)
         # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
+
+
+class ContrastiveProjection(nn.Module):
+    """Projection MLP for contrastive feature learning on detection feature maps.
+
+    Inspired by SimCLR/SupCon-style projection heads. Takes a 4D backbone/neck
+    feature (B, C, H, W) and projects to an L2-normalised embedding of shape
+    (B, c_embed, H, W). Used for hard-negative discrimination via InfoNCE/SupCon
+    contrastive loss between in-GT-box features (positive) and outside-GT-box
+    features (negative).
+
+    Motivation for AFB Chen-TB6208: 54.7% of false positives lie >2 box-diam
+    from any GT (hard-neg background confusion). Feature-level contrastive
+    supervision pushes positive features (real bacilli) to cluster and
+    negative features (smear/debris) to scatter, attacking hard-neg
+    discrimination at the representation level rather than only at the
+    detection output level.
+
+    Args:
+        c_in: input feature channels (typically P3 neck output).
+        c_embed: embedding dimension (default 128; SimCLR-typical).
+    """
+
+    def __init__(self, c_in: int, c_embed: int = 128):
+        super().__init__()
+        c_mid = max(c_embed, c_in // 2)
+        self.proj = nn.Sequential(
+            nn.Conv2d(c_in, c_mid, 1, bias=False),
+            nn.BatchNorm2d(c_mid),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c_mid, c_embed, 1),
+        )
+        self.c_embed = c_embed
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Input (B, C_in, H, W) → output (B, c_embed, H, W), L2-normalised along channel."""
+        e = self.proj(x)
+        # L2 normalise per spatial location so cosine similarity = dot product.
+        return F.normalize(e, dim=1, eps=1e-6)
 
 
 class HierarchicalDFL(nn.Module):
