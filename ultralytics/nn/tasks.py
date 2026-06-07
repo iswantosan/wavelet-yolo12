@@ -48,6 +48,7 @@ from ultralytics.nn.modules import (
     ContrastiveAuxSegDetect,
     DyHeadDetect,
     HDFLDetect,
+    MaskGuidedDetect,
     WaveRegDetect,
     WaveRegDetectP3,
     DWConv,
@@ -351,7 +352,7 @@ class DetectionModel(BaseModel):
                 """Performs a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, Pose, OBB, AuxSegDetect, ContrastiveDetect, ContrastiveAuxSegDetect)) else self.forward(x)
+                return self.forward(x)[0] if isinstance(m, (Segment, Pose, OBB, AuxSegDetect, ContrastiveDetect, ContrastiveAuxSegDetect, MaskGuidedDetect)) else self.forward(x)
 
             m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
@@ -1093,11 +1094,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect, DyHeadDetect, WaveRegDetect, WaveRegDetectP3, HDFLDetect, AuxSegDetect, ContrastiveDetect, ContrastiveAuxSegDetect}:
+        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect, DyHeadDetect, WaveRegDetect, WaveRegDetectP3, HDFLDetect, AuxSegDetect, ContrastiveDetect, ContrastiveAuxSegDetect, MaskGuidedDetect}:
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, Segment, Pose, OBB, WaveRegDetect, WaveRegDetectP3, HDFLDetect, AuxSegDetect, ContrastiveDetect, ContrastiveAuxSegDetect}:
+            if m in {Detect, Segment, Pose, OBB, WaveRegDetect, WaveRegDetectP3, HDFLDetect, AuxSegDetect, ContrastiveDetect, ContrastiveAuxSegDetect, MaskGuidedDetect}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -1219,7 +1220,7 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, WorldDetect, v10Detect, DyHeadDetect, WaveRegDetect, WaveRegDetectP3, HDFLDetect, AuxSegDetect, ContrastiveDetect, ContrastiveAuxSegDetect)):
+            elif isinstance(m, (Detect, WorldDetect, v10Detect, DyHeadDetect, WaveRegDetect, WaveRegDetectP3, HDFLDetect, AuxSegDetect, ContrastiveDetect, ContrastiveAuxSegDetect, MaskGuidedDetect)):
                 return "detect"
 
     # Guess from model filename

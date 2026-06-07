@@ -338,6 +338,17 @@ class v8DetectionLoss:
         self.contrast_weight = float(h.get("contrast_weight", 0.3) or 0.3) if self.is_contrast else 0.0
         self.contrast_temp = float(h.get("contrast_temp", 0.1) or 0.1) if self.is_contrast else 0.1
         self.contrast_n_neg = int(h.get("contrast_n_neg", 32) or 32) if self.is_contrast else 0
+        # MGD support: MaskGuidedDetect sets is_mgd=True. Forward returns
+        # (feats, mask_logit). We supervise mask_logit with the same
+        # LAB a*-channel pseudo-mask used by AuxSeg, BCE-weighted by
+        # mgd_weight. The architectural gating itself (alpha-blend of
+        # P3 with masked-P3) is unsupervised — it's a learnable
+        # mechanism that BCE only nudges toward a sensible mask.
+        self.is_mgd = bool(getattr(m, "is_mgd", False))
+        self.mgd_weight = float(h.get("mgd_weight", 1.0) or 1.0) if self.is_mgd else 0.0
+        if self.is_mgd and not self.is_auxseg:
+            # If MGD without AuxSeg, still need bce_seg for mask BCE.
+            self.bce_seg = nn.BCEWithLogitsLoss(reduction="mean")
         self.device = device
 
         self.use_dfl = m.reg_max > 1
@@ -584,6 +595,7 @@ class v8DetectionLoss:
         # the relevant marker is set on the head.
         seg_logit = None
         contrast_emb = None
+        mask_logit = None
         if isinstance(preds, tuple) and len(preds) >= 2 and isinstance(preds[0], list):
             if self.is_auxseg and self.is_contrast and len(preds) == 3:
                 feats, seg_logit, contrast_emb = preds
@@ -591,6 +603,11 @@ class v8DetectionLoss:
                 feats, seg_logit = preds
             elif self.is_contrast and len(preds) == 2:
                 feats, contrast_emb = preds
+            elif self.is_mgd and len(preds) == 2:
+                # MaskGuidedDetect: (feats_list, mask_logit). mask_logit
+                # has the same shape as AuxSeg seg_logit (B, 1, h, w),
+                # so we reuse the seg_logit branch by aliasing.
+                feats, mask_logit = preds
             else:
                 feats = preds[0]
         else:
@@ -645,10 +662,10 @@ class v8DetectionLoss:
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        # AuxSeg auxiliary loss (dense fg/bg BCE) + Contrastive feature
-        # loss. Both folded into the cls item so the (3,) loss-item
-        # contract stays intact for logging.
-        if seg_logit is not None or contrast_emb is not None:
+        # AuxSeg / MGD (dense fg/bg BCE) + Contrastive feature loss.
+        # All folded into the cls item so the (3,) loss-item contract
+        # stays intact for logging.
+        if seg_logit is not None or contrast_emb is not None or mask_logit is not None:
             img = batch["img"]
             # gt_bboxes was scaled by scale_tensor in preprocess() to pixel
             # coords (xyxy). Filter per-image valid rows via mask_gt.
@@ -660,13 +677,16 @@ class v8DetectionLoss:
 
             aux_total = torch.tensor(0.0, device=self.device, dtype=loss.dtype)
             if seg_logit is not None:
-                mask_shape = seg_logit.shape[-2:]
-                pseudo = self.make_auxseg_target(img.detach(), gt_xyxy_per_image, mask_shape)
+                pseudo = self.make_auxseg_target(img.detach(), gt_xyxy_per_image, seg_logit.shape[-2:])
                 aux_total = aux_total + self.bce_seg(seg_logit, pseudo) * self.auxseg_weight
             if contrast_emb is not None:
                 aux_total = aux_total + self.compute_contrast_loss(
                     contrast_emb, img.detach(), gt_xyxy_per_image
                 ) * self.contrast_weight
+            if mask_logit is not None:
+                # MGD shares the LAB a* pseudo-mask target with AuxSeg.
+                pseudo_mgd = self.make_auxseg_target(img.detach(), gt_xyxy_per_image, mask_logit.shape[-2:])
+                aux_total = aux_total + self.bce_seg(mask_logit, pseudo_mgd) * self.mgd_weight
 
             total = (loss.sum() + aux_total) * batch_size
             items = torch.stack([loss[0].detach(), loss[1].detach() + aux_total.detach(), loss[2].detach()])

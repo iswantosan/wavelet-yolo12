@@ -81,6 +81,7 @@ def _check_loss_compat(cfg: str):
         contrast_weight = 0.3
         contrast_temp = 0.1
         contrast_n_neg = 16
+        mgd_weight = 1.0
         def get(self, k, default=None): return getattr(self, k, default)
     model.args = _H()
 
@@ -103,6 +104,7 @@ if __name__ == "__main__":
         "ultralytics/cfg/models/v12/yolov12s-auxseg-p3p4.yaml",
         "ultralytics/cfg/models/v12/yolov12s-contrast.yaml",
         "ultralytics/cfg/models/v12/yolov12s-contrast-auxseg.yaml",
+        "ultralytics/cfg/models/v12/yolov12s-mgd.yaml",
     )
 
     # Tier 1: structural build + forward (eval mode)

@@ -15,7 +15,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect", "WaveRegDetectP3", "HDFLDetect", "AuxSegDetect", "ContrastiveDetect", "ContrastiveAuxSegDetect"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "DyHeadDetect", "WaveRegDetect", "WaveRegDetectP3", "HDFLDetect", "AuxSegDetect", "ContrastiveDetect", "ContrastiveAuxSegDetect", "MaskGuidedDetect"
 
 
 class Detect(nn.Module):
@@ -629,6 +629,77 @@ class ContrastiveDetect(Detect):
             for i in range(self.nl):
                 x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
             return x, contrast_emb
+        return super().forward(x)
+
+
+class MaskGuidedDetect(Detect):
+    """YOLO Detect head with foreground-mask gating in the FORWARD path.
+
+    Architectural mechanism for attacking the dominant hard-negative
+    failure mode on AFB Chen-TB6208 (54.7% of FPs lie >2 box-diameters
+    from any GT — background confusion, not box-reg). Unlike auxiliary
+    segmentation (AuxSegDetect), where the seg branch only influences
+    training via gradient backprop, MaskGuidedDetect applies the mask
+    INSIDE the forward path, attenuating P3 feature activations at
+    background locations BEFORE the detection branches see them:
+
+        mask = sigmoid(mask_head(P3))                # (B, 1, H/8, W/8)
+        P3_gated = (1 − α) · P3 + α · (P3 ⊙ mask)    # learnable α blend
+
+    At α=0 the head is equivalent to standard Detect (no gating); α>0
+    progressively suppresses features at low-mask locations. α is a
+    learnable scalar initialised to 0.1 — gentle by default, model can
+    push higher if mask is reliable.
+
+    The mask is supervised by the same domain-aware LAB a*-channel
+    pseudo-mask used by AuxSegDetect (computed in v8DetectionLoss via
+    ``make_auxseg_target``), BCE-weighted by ``mgd_weight`` (default
+    1.0). The marker ``is_mgd=True`` wires the loss.
+
+    Cost vs baseline yolov12s: +~30k params, +~1% FLOPs. Inference uses
+    the gating too (NOT dropped at eval), so the +1% applies at val/test
+    as well — accepted as the architectural mechanism whose effect we
+    want at inference time.
+    """
+
+    # Marker for v8DetectionLoss to apply BCE on the mask logit.
+    is_mgd = True
+
+    def __init__(self, nc: int = 80, ch: tuple = ()):
+        super().__init__(nc, ch)
+        c_in = ch[0]
+        c_mid = max(32, c_in // 4)
+        # Mask predictor (3-layer conv → 1-channel logit).
+        self.mask_head = nn.Sequential(
+            Conv(c_in, c_mid, 3),
+            Conv(c_mid, c_mid, 3),
+            nn.Conv2d(c_mid, 1, 1),
+        )
+        # Learnable blend scalar. Init 0.1 → start close to identity
+        # (mostly raw P3), grow if mask gating helps detection.
+        self.mgd_alpha = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x):
+        """Apply mask gating to P3, then run standard Detect.
+
+        Training: returns ``(det_features_list, mask_logit)`` so the
+        loss class can wire BCE supervision on the mask. Eval: returns
+        standard Detect output (mask gating still applied — it is part
+        of the architecture, not a training-only branch).
+        """
+        # Compute mask logit from RAW P3 (before gating).
+        mask_logit = self.mask_head(x[0])           # (B, 1, h, w)
+        mask = torch.sigmoid(mask_logit)
+        # Apply learnable-blend gating to P3 in-place.
+        alpha = self.mgd_alpha
+        x[0] = (1.0 - alpha) * x[0] + alpha * (x[0] * mask)
+
+        if self.training:
+            for i in range(self.nl):
+                x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            return x, mask_logit
+
+        # Eval / export: standard Detect with the already-gated P3.
         return super().forward(x)
 
 
