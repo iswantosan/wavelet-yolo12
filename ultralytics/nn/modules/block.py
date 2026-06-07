@@ -118,14 +118,23 @@ class DCNBlock(nn.Module):
         self.act = nn.SiLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.offset_mask(x)                  # (B, 3·k·k, H, W)
+        # torchvision.ops.DeformConv2d has known float16 instability in
+        # several releases — force fp32 inside the DCN op and cast back
+        # to the input dtype on exit. This keeps AMP compatibility
+        # without disabling autocast for the whole training loop.
+        orig_dtype = x.dtype
+        x32 = x.float() if x.dtype != torch.float32 else x
+
+        out = self.offset_mask(x32)                # (B, 3·k·k, H, W)
         o1, o2, mask = out.chunk(3, dim=1)
         offset = torch.cat([o1, o2], dim=1)        # (B, 2·k·k, H, W)
         mask = torch.sigmoid(mask)                 # (B, k·k, H, W) in (0, 1)
-        x = self.dcn(x, offset, mask)
-        x = self.bn(x)
-        x = self.act(x)
-        return x
+        y = self.dcn(x32, offset, mask)
+        y = self.bn(y)
+        y = self.act(y)
+        if y.dtype != orig_dtype:
+            y = y.to(orig_dtype)
+        return y
 
 
 class ContrastiveProjection(nn.Module):
