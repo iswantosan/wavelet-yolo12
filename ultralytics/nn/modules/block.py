@@ -14,6 +14,7 @@ __all__ = (
     "DFL",
     "HierarchicalDFL",
     "ContrastiveProjection",
+    "DCNBlock",
     "HGBlock",
     "HGStem",
     "SPP",
@@ -75,6 +76,56 @@ class DFL(nn.Module):
         b, _, a = x.shape  # batch, channels, anchors
         return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(b, 4, a)
         # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
+
+
+class DCNBlock(nn.Module):
+    """Deformable Convolution v2 block (Dai 2017, Zhu 2018).
+
+    Standard YOLO neck conv uses fixed 3×3 grid sampling — suboptimal
+    for irregular-shaped objects like rod-shaped acid-fast bacilli that
+    appear in random orientations under microscopy. DCN v2 predicts
+    per-spatial-location offsets and modulation gates for each of the
+    k×k sample points, so the receptive field can adapt to object
+    geometry (e.g. align along a rod's principal axis).
+
+    Implementation uses ``torchvision.ops.DeformConv2d``. The
+    offset+modulation predictor is initialised to zero, so at step 0
+    the layer samples on the standard grid with modulation 0.5 —
+    approximately a half-strength regular conv. Training learns
+    non-zero offsets and modulation as it discovers useful shape
+    adaptations.
+
+    Used as a drop-in refinement block in the neck (similar to
+    StripAttnBlock pattern).
+    """
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1, p: int | None = None, g: int = 1):
+        super().__init__()
+        # Lazy import — torchvision is already an Ultralytics dep but
+        # importing inside __init__ avoids a global import for users
+        # who never instantiate DCN.
+        from torchvision.ops import DeformConv2d
+        if p is None:
+            p = k // 2
+        self.k = k
+        # Predict 2·k·k offsets (Δy, Δx per kernel point) + k·k modulation logits.
+        self.offset_mask = nn.Conv2d(c1, 3 * k * k, k, s, p)
+        nn.init.zeros_(self.offset_mask.weight)
+        nn.init.zeros_(self.offset_mask.bias)
+        # Deformable conv core. No bias — BN absorbs.
+        self.dcn = DeformConv2d(c1, c2, k, s, p, groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.offset_mask(x)                  # (B, 3·k·k, H, W)
+        o1, o2, mask = out.chunk(3, dim=1)
+        offset = torch.cat([o1, o2], dim=1)        # (B, 2·k·k, H, W)
+        mask = torch.sigmoid(mask)                 # (B, k·k, H, W) in (0, 1)
+        x = self.dcn(x, offset, mask)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
 
 
 class ContrastiveProjection(nn.Module):

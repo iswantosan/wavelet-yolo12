@@ -105,6 +105,7 @@ if __name__ == "__main__":
         "ultralytics/cfg/models/v12/yolov12s-contrast.yaml",
         "ultralytics/cfg/models/v12/yolov12s-contrast-auxseg.yaml",
         "ultralytics/cfg/models/v12/yolov12s-mgd.yaml",
+        "ultralytics/cfg/models/v12/yolov12s-dcn.yaml",
     )
 
     # Tier 1: structural build + forward (eval mode)
